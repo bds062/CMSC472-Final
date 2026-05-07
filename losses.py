@@ -17,7 +17,7 @@ class ClassificationLoss(nn.Module):
 
 # Contrastive
 ## Supervised contrastic learning:
-## L = sum_1toI{-1 / |P(i)| sum_pInP(i){log(e^(z_i dot z_p / tau)) / sum_aInA(i){e^(z_i dot z_a / tau)} }}
+## L = sum_1toI{-1 / |P(i)| sum_pInP(i) * {log(e^(z_i dot z_p / tau)) / sum_aInA(i){e^(z_i dot z_a / tau)} }}
 #### i = index anchor sample
 #### P(i) all positives in batch
 #### A(i) all samples in batch other than i
@@ -31,12 +31,27 @@ class ContrastiveLoss(nn.Module):
         self.tau = temperature
     
     def forward(self, features, labels):
-        I = features.shape[0]
+        N = features.shape[0]
+        self_mask = torch.eye(N, dtype=torch.bool, device=features.device)
+        Z = F.normalize(features, dim=1)
 
-        for i in I:
-            inner = 0
-            pos_ind = label = 
-            for p in 
+        labels = labels.view(-1, 1)
+        pos_mask = torch.eq(labels, labels.T).float()
+        pos_mask.masked_fill_(self_mask, 0)
+
+        zi_DOT_za = torch.mm(Z, Z.T) / self.tau
+        zi_DOT_za_stable = zi_DOT_za - zi_DOT_za.max(dim=1, keepdim=True).values.detach()
+        denominator = torch.exp(zi_DOT_za_stable).masked_fill_(self_mask, 0).sum(dim=1, keepdim=True)
+        numerator = torch.exp(zi_DOT_za_stable).masked_fill(~pos_mask.bool(), 0)
+        log_prob = torch.log(numerator + 1e-8) - torch.log(denominator + 1e-8)
+
+        Pi_cardinality = pos_mask.sum(dim=1)
+        loss_per_anchor = -(pos_mask * log_prob).sum(dim=1) / Pi_cardinality
+        loss = loss_per_anchor[Pi_cardinality > 0].mean()
+
+        return loss
+
+                
 
 
 
