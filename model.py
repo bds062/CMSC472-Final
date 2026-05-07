@@ -1,401 +1,663 @@
-
 """
- ARL_EEGModels - A collection of Convolutional Neural Network models for EEG
- Signal Processing and Classification, using Keras and Tensorflow
+model.py
+EEGNet re-implemented in PyTorch with dual-head architecture for joint
+classification + contrastive learning (SupCon / Contrastive-Prototype).
 
- Requirements:
-    (1) tensorflow == 2.X (as of this writing, 2.0 - 2.3 have been verified
-        as working)
- 
- To run the EEG/MEG ERP classification sample script, you will also need
+Expected input shape : (B, 1, Chans, Samples)
+  B       – batch size
+  1       – single EEG "image" channel (Conv2d convention)
+  Chans   – number of EEG electrodes  (SEED/SEED-IV: 62)
+  Samples – time points per segment   (e.g. 200 @ 200 Hz → 1 s window)
 
-    (4) mne >= 0.17.1
-    (5) PyRiemann >= 0.2.5
-    (6) scikit-learn >= 0.20.1
-    (7) matplotlib >= 2.2.3
-    
- To use:
-    
-    (1) Place this file in the PYTHONPATH variable in your IDE (i.e.: Spyder)
-    (2) Import the model as
-        
-        from EEGModels import EEGNet    
-        
-        model = EEGNet(nb_classes = ..., Chans = ..., Samples = ...)
-        
-    (3) Then compile and fit the model
-    
-        model.compile(loss = ..., optimizer = ..., metrics = ...)
-        fitted    = model.fit(...)
-        predicted = model.predict(...)
+Quick-start
+-----------
+    from model import EEGNetContrastive, build_model
+    from losses import ClassificationLoss, ContrastiveLoss, ContrastivePrototype
 
- Portions of this project are works of the United States Government and are not
- subject to domestic copyright protection under 17 USC Sec. 105.  Those 
- portions are released world-wide under the terms of the Creative Commons Zero 
- 1.0 (CC0) license.  
- 
- Other portions of this project are subject to domestic copyright protection 
- under 17 USC Sec. 105.  Those portions are licensed under the Apache 2.0 
- license.  The complete text of the license governing this material is in 
- the file labeled LICENSE.TXT that is a part of this project's official 
- distribution. 
+    model = build_model(nb_classes=4, Chans=62, Samples=200)
+    logits, proj = model(batch_eeg)           # forward pass
+    loss = cls_fn(logits, labels) + 0.5 * con_fn(proj, labels)
 """
 
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Activation, Permute, Dropout
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D
-from tensorflow.keras.layers import SeparableConv2D, DepthwiseConv2D
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras.layers import SpatialDropout2D
-from tensorflow.keras.regularizers import l1_l2
-from tensorflow.keras.layers import Input, Flatten
-from tensorflow.keras.constraints import max_norm
-from tensorflow.keras import backend as K
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-def EEGNet(nb_classes, Chans = 64, Samples = 128, 
-             dropoutRate = 0.5, kernLength = 64, F1 = 8, 
-             D = 2, F2 = 16, norm_rate = 0.25, dropoutType = 'Dropout'):
-    """ Keras Implementation of EEGNet
-    http://iopscience.iop.org/article/10.1088/1741-2552/aace8c/meta
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  BUILDING BLOCKS
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Note that this implements the newest version of EEGNet and NOT the earlier
-    version (version v1 and v2 on arxiv). We strongly recommend using this
-    architecture as it performs much better and has nicer properties than
-    our earlier version. For example:
-        
-        1. Depthwise Convolutions to learn spatial filters within a 
-        temporal convolution. The use of the depth_multiplier option maps 
-        exactly to the number of spatial filters learned within a temporal
-        filter. This matches the setup of algorithms like FBCSP which learn 
-        spatial filters within each filter in a filter-bank. This also limits 
-        the number of free parameters to fit when compared to a fully-connected
-        convolution. 
-        
-        2. Separable Convolutions to learn how to optimally combine spatial
-        filters across temporal bands. Separable Convolutions are Depthwise
-        Convolutions followed by (1x1) Pointwise Convolutions. 
-        
-    
-    While the original paper used Dropout, we found that SpatialDropout2D 
-    sometimes produced slightly better results for classification of ERP 
-    signals. However, SpatialDropout2D significantly reduced performance 
-    on the Oscillatory dataset (SMR, BCI-IV Dataset 2A). We recommend using
-    the default Dropout in most cases.
-        
-    Assumes the input signal is sampled at 128Hz. If you want to use this model
-    for any other sampling rate you will need to modify the lengths of temporal
-    kernels and average pooling size in blocks 1 and 2 as needed (double the 
-    kernel lengths for double the sampling rate, etc). Note that we haven't 
-    tested the model performance with this rule so this may not work well. 
-    
-    The model with default parameters gives the EEGNet-8,2 model as discussed
-    in the paper. This model should do pretty well in general, although it is
-	advised to do some model searching to get optimal performance on your
-	particular dataset.
-
-    We set F2 = F1 * D (number of input filters = number of output filters) for
-    the SeparableConv2D layer. We haven't extensively tested other values of this
-    parameter (say, F2 < F1 * D for compressed learning, and F2 > F1 * D for
-    overcomplete). We believe the main parameters to focus on are F1 and D. 
-
-    Inputs:
-        
-      nb_classes      : int, number of classes to classify
-      Chans, Samples  : number of channels and time points in the EEG data
-      dropoutRate     : dropout fraction
-      kernLength      : length of temporal convolution in first layer. We found
-                        that setting this to be half the sampling rate worked
-                        well in practice. For the SMR dataset in particular
-                        since the data was high-passed at 4Hz we used a kernel
-                        length of 32.     
-      F1, F2          : number of temporal filters (F1) and number of pointwise
-                        filters (F2) to learn. Default: F1 = 8, F2 = F1 * D. 
-      D               : number of spatial filters to learn within each temporal
-                        convolution. Default: D = 2
-      dropoutType     : Either SpatialDropout2D or Dropout, passed as a string.
-
+class _DepthwiseConv2d(nn.Module):
     """
-    
-    if dropoutType == 'SpatialDropout2D':
-        dropoutType = SpatialDropout2D
-    elif dropoutType == 'Dropout':
-        dropoutType = Dropout
-    else:
-        raise ValueError('dropoutType must be one of SpatialDropout2D '
-                         'or Dropout, passed as a string.')
-    
-    input1   = Input(shape = (Chans, Samples, 1))
-
-    ##################################################################
-    block1       = Conv2D(F1, (1, kernLength), padding = 'same',
-                                   input_shape = (Chans, Samples, 1),
-                                   use_bias = False)(input1)
-    block1       = BatchNormalization()(block1)
-    block1       = DepthwiseConv2D((Chans, 1), use_bias = False, 
-                                   depth_multiplier = D,
-                                   depthwise_constraint = max_norm(1.))(block1)
-    block1       = BatchNormalization()(block1)
-    block1       = Activation('elu')(block1)
-    block1       = AveragePooling2D((1, 4))(block1)
-    block1       = dropoutType(dropoutRate)(block1)
-    
-    block2       = SeparableConv2D(F2, (1, 16),
-                                   use_bias = False, padding = 'same')(block1)
-    block2       = BatchNormalization()(block2)
-    block2       = Activation('elu')(block2)
-    block2       = AveragePooling2D((1, 8))(block2)
-    block2       = dropoutType(dropoutRate)(block2)
-        
-    flatten      = Flatten(name = 'flatten')(block2)
-    
-    dense        = Dense(nb_classes, name = 'dense', 
-                         kernel_constraint = max_norm(norm_rate))(flatten)
-    softmax      = Activation('softmax', name = 'softmax')(dense)
-    
-    return Model(inputs=input1, outputs=softmax)
-
-
-
-
-def EEGNet_SSVEP(nb_classes = 12, Chans = 8, Samples = 256, 
-             dropoutRate = 0.5, kernLength = 256, F1 = 96, 
-             D = 1, F2 = 96, dropoutType = 'Dropout'):
-    """ SSVEP Variant of EEGNet, as used in [1]. 
-
-    Inputs:
-        
-      nb_classes      : int, number of classes to classify
-      Chans, Samples  : number of channels and time points in the EEG data
-      dropoutRate     : dropout fraction
-      kernLength      : length of temporal convolution in first layer
-      F1, F2          : number of temporal filters (F1) and number of pointwise
-                        filters (F2) to learn. 
-      D               : number of spatial filters to learn within each temporal
-                        convolution.
-      dropoutType     : Either SpatialDropout2D or Dropout, passed as a string.
-      
-      
-    [1]. Waytowich, N. et. al. (2018). Compact Convolutional Neural Networks
-    for Classification of Asynchronous Steady-State Visual Evoked Potentials.
-    Journal of Neural Engineering vol. 15(6). 
-    http://iopscience.iop.org/article/10.1088/1741-2552/aae5d8
-
+    Depthwise Conv2d with an optional per-filter max-norm weight constraint.
+    Mirrors Keras DepthwiseConv2D + depthwise_constraint=max_norm(1.).
     """
-    
-    if dropoutType == 'SpatialDropout2D':
-        dropoutType = SpatialDropout2D
-    elif dropoutType == 'Dropout':
-        dropoutType = Dropout
-    else:
-        raise ValueError('dropoutType must be one of SpatialDropout2D '
-                         'or Dropout, passed as a string.')
-    
-    input1   = Input(shape = (Chans, Samples, 1))
+    def __init__(self, in_channels, depth_multiplier, kernel_size,
+                 max_norm_val=1.0, bias=False):
+        super().__init__()
+        out_channels = in_channels * depth_multiplier
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size,
+            groups=in_channels, bias=bias
+        )
+        self.max_norm_val = max_norm_val
 
-    ##################################################################
-    block1       = Conv2D(F1, (1, kernLength), padding = 'same',
-                                   input_shape = (Chans, Samples, 1),
-                                   use_bias = False)(input1)
-    block1       = BatchNormalization()(block1)
-    block1       = DepthwiseConv2D((Chans, 1), use_bias = False, 
-                                   depth_multiplier = D,
-                                   depthwise_constraint = max_norm(1.))(block1)
-    block1       = BatchNormalization()(block1)
-    block1       = Activation('elu')(block1)
-    block1       = AveragePooling2D((1, 4))(block1)
-    block1       = dropoutType(dropoutRate)(block1)
-    
-    block2       = SeparableConv2D(F2, (1, 16),
-                                   use_bias = False, padding = 'same')(block1)
-    block2       = BatchNormalization()(block2)
-    block2       = Activation('elu')(block2)
-    block2       = AveragePooling2D((1, 8))(block2)
-    block2       = dropoutType(dropoutRate)(block2)
-        
-    flatten      = Flatten(name = 'flatten')(block2)
-    
-    dense        = Dense(nb_classes, name = 'dense')(flatten)
-    softmax      = Activation('softmax', name = 'softmax')(dense)
-    
-    return Model(inputs=input1, outputs=softmax)
+    def _apply_max_norm(self):
+        """Clamp each filter's L2 norm to at most max_norm_val."""
+        with torch.no_grad():
+            w = self.conv.weight                           # (C_out, 1, kH, kW)
+            norm = w.norm(2, dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
+            desired = norm.clamp(max=self.max_norm_val)
+            self.conv.weight.copy_(w * desired / norm)
+
+    def forward(self, x):
+        self._apply_max_norm()
+        return self.conv(x)
 
 
+class _SeparableConv2d(nn.Module):
+    """
+    Depthwise-then-pointwise (separable) convolution.
+    Mirrors Keras SeparableConv2D.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 padding=0, bias=False):
+        super().__init__()
+        self.depthwise  = nn.Conv2d(in_channels, in_channels, kernel_size,
+                                    padding=padding, groups=in_channels, bias=bias)
+        self.pointwise  = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
 
-def EEGNet_old(nb_classes, Chans = 64, Samples = 128, regRate = 0.0001,
-           dropoutRate = 0.25, kernels = [(2, 32), (8, 4)], strides = (2, 4)):
-    """ Keras Implementation of EEGNet_v1 (https://arxiv.org/abs/1611.08024v2)
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
 
-    This model is the original EEGNet model proposed on arxiv
-            https://arxiv.org/abs/1611.08024v2
-    
-    with a few modifications: we use striding instead of max-pooling as this 
-    helped slightly in classification performance while also providing a 
-    computational speed-up. 
-    
-    Note that we no longer recommend the use of this architecture, as the new
-    version of EEGNet performs much better overall and has nicer properties.
-    
-    Inputs:
-        
-        nb_classes     : total number of final categories
-        Chans, Samples : number of EEG channels and samples, respectively
-        regRate        : regularization rate for L1 and L2 regularizations
-        dropoutRate    : dropout fraction
-        kernels        : the 2nd and 3rd layer kernel dimensions (default is 
-                         the [2, 32] x [8, 4] configuration)
-        strides        : the stride size (note that this replaces the max-pool
-                         used in the original paper)
-    
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  EEGNET ENCODER  (blocks 1 & 2 → flat embedding)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EEGNetEncoder(nn.Module):
+    """
+    EEGNet backbone that outputs a flat feature vector.
+    Does NOT include a classification head — that lives in EEGNetContrastive.
+
+    Architecture
+    ────────────
+    Block 1 – temporal convolution
+      Conv2d(1, F1, (1, kernLength))        # learn F1 temporal filters
+      BatchNorm2d
+      DepthwiseConv2d((Chans, 1), D×)       # learn D spatial filters per temporal filter
+      BatchNorm2d → ELU → AvgPool(1,4) → Dropout
+
+    Block 2 – separable convolution
+      SeparableConv2d(F1*D, F2, (1, 16))   # combine spatial filters across time
+      BatchNorm2d → ELU → AvgPool(1,8) → Dropout
+
+    Flatten → embedding of dimension `embed_dim`
+
+    Parameters
+    ----------
+    Chans       : int   – EEG electrode count          (default 62 for SEED)
+    Samples     : int   – time points per window       (default 200)
+    F1          : int   – number of temporal filters   (default 8)
+    D           : int   – spatial depth multiplier     (default 2)
+    F2          : int   – pointwise filter count       (default F1*D = 16)
+    kernLength  : int   – temporal kernel length       (default Samples//2)
+    dropoutRate : float – dropout probability          (default 0.5)
     """
 
-    # start the model
-    input_main   = Input((Chans, Samples))
-    layer1       = Conv2D(16, (Chans, 1), input_shape=(Chans, Samples, 1),
-                                 kernel_regularizer = l1_l2(l1=regRate, l2=regRate))(input_main)
-    layer1       = BatchNormalization()(layer1)
-    layer1       = Activation('elu')(layer1)
-    layer1       = Dropout(dropoutRate)(layer1)
-    
-    permute_dims = 2, 1, 3
-    permute1     = Permute(permute_dims)(layer1)
-    
-    layer2       = Conv2D(4, kernels[0], padding = 'same', 
-                            kernel_regularizer=l1_l2(l1=0.0, l2=regRate),
-                            strides = strides)(permute1)
-    layer2       = BatchNormalization()(layer2)
-    layer2       = Activation('elu')(layer2)
-    layer2       = Dropout(dropoutRate)(layer2)
-    
-    layer3       = Conv2D(4, kernels[1], padding = 'same',
-                            kernel_regularizer=l1_l2(l1=0.0, l2=regRate),
-                            strides = strides)(layer2)
-    layer3       = BatchNormalization()(layer3)
-    layer3       = Activation('elu')(layer3)
-    layer3       = Dropout(dropoutRate)(layer3)
-    
-    flatten      = Flatten(name = 'flatten')(layer3)
-    
-    dense        = Dense(nb_classes, name = 'dense')(flatten)
-    softmax      = Activation('softmax', name = 'softmax')(dense)
-    
-    return Model(inputs=input_main, outputs=softmax)
+    def __init__(
+        self,
+        Chans       = 62,
+        Samples     = 200,
+        F1          = 8,
+        D           = 2,
+        F2          = None,       # defaults to F1 * D
+        kernLength  = None,       # defaults to Samples // 2
+        dropoutRate = 0.5,
+    ):
+        super().__init__()
+
+        F2         = F2         or F1 * D
+        kernLength = kernLength or (Samples // 2)
+
+        # ── Block 1 ───────────────────────────────────────────────────────
+        self.b1_temporal = nn.Conv2d(
+            1, F1, (1, kernLength),
+            padding=(0, kernLength // 2), bias=False
+        )
+        self.b1_bn1      = nn.BatchNorm2d(F1)
+        self.b1_spatial  = _DepthwiseConv2d(F1, D, (Chans, 1), max_norm_val=1.0)
+        self.b1_bn2      = nn.BatchNorm2d(F1 * D)
+        self.b1_pool     = nn.AvgPool2d((1, 4))
+        self.b1_drop     = nn.Dropout(dropoutRate)
+
+        # ── Block 2 ───────────────────────────────────────────────────────
+        self.b2_sep      = _SeparableConv2d(F1 * D, F2, (1, 16), padding=(0, 8))
+        self.b2_bn       = nn.BatchNorm2d(F2)
+        self.b2_pool     = nn.AvgPool2d((1, 8))
+        self.b2_drop     = nn.Dropout(dropoutRate)
+
+        # ── derive flat embedding size with a dry run ─────────────────────
+        self.embed_dim   = self._infer_embed_dim(Chans, Samples)
+        self._init_weights()
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    def _infer_embed_dim(self, Chans, Samples):
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, Chans, Samples)
+            out   = self._forward_blocks(dummy)
+        return out.shape[1]
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    # ── forward ───────────────────────────────────────────────────────────
+
+    def _forward_blocks(self, x):
+        # Block 1
+        x = self.b1_temporal(x)
+        x = self.b1_bn1(x)
+        x = self.b1_spatial(x)
+        x = self.b1_bn2(x)
+        x = F.elu(x)
+        x = self.b1_pool(x)
+        x = self.b1_drop(x)
+        # Block 2
+        x = self.b2_sep(x)
+        x = self.b2_bn(x)
+        x = F.elu(x)
+        x = self.b2_pool(x)
+        x = self.b2_drop(x)
+        return x.flatten(start_dim=1)
+
+    def forward(self, x):
+        """
+        x : (B, 1, Chans, Samples)
+        returns : (B, embed_dim)
+        """
+        return self._forward_blocks(x)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  PROJECTION HEAD  (encoder output → contrastive loss input)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def DeepConvNet(nb_classes, Chans = 64, Samples = 256,
-                dropoutRate = 0.5):
-    """ Keras implementation of the Deep Convolutional Network as described in
-    Schirrmeister et. al. (2017), Human Brain Mapping.
-    
-    This implementation assumes the input is a 2-second EEG signal sampled at 
-    128Hz, as opposed to signals sampled at 250Hz as described in the original
-    paper. We also perform temporal convolutions of length (1, 5) as opposed
-    to (1, 10) due to this sampling rate difference. 
-    
-    Note that we use the max_norm constraint on all convolutional layers, as 
-    well as the classification layer. We also change the defaults for the
-    BatchNormalization layer. We used this based on a personal communication 
-    with the original authors.
-    
-                      ours        original paper
-    pool_size        1, 2        1, 3
-    strides          1, 2        1, 3
-    conv filters     1, 5        1, 10
-    
-    Note that this implementation has not been verified by the original 
-    authors. 
-    
+class ProjectionHead(nn.Module):
+    """
+    Two-layer MLP that maps the encoder embedding into a lower-dimensional
+    space suited for contrastive learning (SimCLR / SupCon style).
+
+    Linear → BN → ReLU → Linear
+
+    The final layer has NO activation; the contrastive losses apply
+    F.normalize internally.
+
+    Parameters
+    ----------
+    in_dim     : int – encoder embedding dimension
+    hidden_dim : int – intermediate MLP width     (default 128)
+    out_dim    : int – contrastive projection dim (default 64)
     """
 
-    # start the model
-    input_main   = Input((Chans, Samples, 1))
-    block1       = Conv2D(25, (1, 5), 
-                                 input_shape=(Chans, Samples, 1),
-                                 kernel_constraint = max_norm(2., axis=(0,1,2)))(input_main)
-    block1       = Conv2D(25, (Chans, 1),
-                                 kernel_constraint = max_norm(2., axis=(0,1,2)))(block1)
-    block1       = BatchNormalization(epsilon=1e-05, momentum=0.9)(block1)
-    block1       = Activation('elu')(block1)
-    block1       = MaxPooling2D(pool_size=(1, 2), strides=(1, 2))(block1)
-    block1       = Dropout(dropoutRate)(block1)
-  
-    block2       = Conv2D(50, (1, 5),
-                                 kernel_constraint = max_norm(2., axis=(0,1,2)))(block1)
-    block2       = BatchNormalization(epsilon=1e-05, momentum=0.9)(block2)
-    block2       = Activation('elu')(block2)
-    block2       = MaxPooling2D(pool_size=(1, 2), strides=(1, 2))(block2)
-    block2       = Dropout(dropoutRate)(block2)
-    
-    block3       = Conv2D(100, (1, 5),
-                                 kernel_constraint = max_norm(2., axis=(0,1,2)))(block2)
-    block3       = BatchNormalization(epsilon=1e-05, momentum=0.9)(block3)
-    block3       = Activation('elu')(block3)
-    block3       = MaxPooling2D(pool_size=(1, 2), strides=(1, 2))(block3)
-    block3       = Dropout(dropoutRate)(block3)
-    
-    block4       = Conv2D(200, (1, 5),
-                                 kernel_constraint = max_norm(2., axis=(0,1,2)))(block3)
-    block4       = BatchNormalization(epsilon=1e-05, momentum=0.9)(block4)
-    block4       = Activation('elu')(block4)
-    block4       = MaxPooling2D(pool_size=(1, 2), strides=(1, 2))(block4)
-    block4       = Dropout(dropoutRate)(block4)
-    
-    flatten      = Flatten()(block4)
-    
-    dense        = Dense(nb_classes, kernel_constraint = max_norm(0.5))(flatten)
-    softmax      = Activation('softmax')(dense)
-    
-    return Model(inputs=input_main, outputs=softmax)
+    def __init__(self, in_dim, hidden_dim=128, out_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim, bias=False),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+
+    def forward(self, z):
+        """
+        z   : (B, in_dim)
+        out : (B, out_dim)  – NOT yet L2-normalised; losses do that
+        """
+        return self.net(z)
 
 
-# need these for ShallowConvNet
-def square(x):
-    return K.square(x)
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  CLASSIFICATION HEAD  (encoder output → class logits)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def log(x):
-    return K.log(K.clip(x, min_value = 1e-7, max_value = 10000))   
+class ClassificationHead(nn.Module):
+    """
+    Single linear layer: embed_dim → nb_classes.
+    A max-norm constraint on the weight matrix mirrors the original Keras
+    model and can help prevent the classification loss from dominating.
 
-
-def ShallowConvNet(nb_classes, Chans = 64, Samples = 128, dropoutRate = 0.5):
-    """ Keras implementation of the Shallow Convolutional Network as described
-    in Schirrmeister et. al. (2017), Human Brain Mapping.
-    
-    Assumes the input is a 2-second EEG signal sampled at 128Hz. Note that in 
-    the original paper, they do temporal convolutions of length 25 for EEG
-    data sampled at 250Hz. We instead use length 13 since the sampling rate is 
-    roughly half of the 250Hz which the paper used. The pool_size and stride
-    in later layers is also approximately half of what is used in the paper.
-    
-    Note that we use the max_norm constraint on all convolutional layers, as 
-    well as the classification layer. We also change the defaults for the
-    BatchNormalization layer. We used this based on a personal communication 
-    with the original authors.
-    
-                     ours        original paper
-    pool_size        1, 35       1, 75
-    strides          1, 7        1, 15
-    conv filters     1, 13       1, 25    
-    
-    Note that this implementation has not been verified by the original 
-    authors. We do note that this implementation reproduces the results in the
-    original paper with minor deviations. 
+    Parameters
+    ----------
+    in_dim     : int   – encoder embedding dimension
+    nb_classes : int   – number of emotion classes (3 for SEED, 4 for SEED-IV)
+    max_norm   : float – per-row L2 norm ceiling for the weight matrix
     """
 
-    # start the model
-    input_main   = Input((Chans, Samples, 1))
-    block1       = Conv2D(40, (1, 13), 
-                                 input_shape=(Chans, Samples, 1),
-                                 kernel_constraint = max_norm(2., axis=(0,1,2)))(input_main)
-    block1       = Conv2D(40, (Chans, 1), use_bias=False, 
-                          kernel_constraint = max_norm(2., axis=(0,1,2)))(block1)
-    block1       = BatchNormalization(epsilon=1e-05, momentum=0.9)(block1)
-    block1       = Activation(square)(block1)
-    block1       = AveragePooling2D(pool_size=(1, 35), strides=(1, 7))(block1)
-    block1       = Activation(log)(block1)
-    block1       = Dropout(dropoutRate)(block1)
-    flatten      = Flatten()(block1)
-    dense        = Dense(nb_classes, kernel_constraint = max_norm(0.5))(flatten)
-    softmax      = Activation('softmax')(dense)
-    
-    return Model(inputs=input_main, outputs=softmax)
+    def __init__(self, in_dim, nb_classes, max_norm_val=0.25):
+        super().__init__()
+        self.fc           = nn.Linear(in_dim, nb_classes)
+        self.max_norm_val = max_norm_val
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def _apply_max_norm(self):
+        with torch.no_grad():
+            w    = self.fc.weight                        # (nb_classes, in_dim)
+            norm = w.norm(2, dim=1, keepdim=True).clamp(min=1e-8)
+            cap  = norm.clamp(max=self.max_norm_val)
+            self.fc.weight.copy_(w * cap / norm)
+
+    def forward(self, z):
+        """
+        z   : (B, in_dim)
+        out : (B, nb_classes) – raw logits (no softmax; losses handle that)
+        """
+        self._apply_max_norm()
+        return self.fc(z)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  FULL MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EEGNetContrastive(nn.Module):
+    """
+    End-to-end model:
+
+        EEGNetEncoder ──┬──► ProjectionHead ──► proj    (→ ContrastiveLoss)
+                        └──► ClassificationHead ──► logits (→ ClassificationLoss)
+
+    Both heads are trained jointly:
+        loss = ClassificationLoss(logits, labels)
+             + λ * ContrastiveLoss(proj, labels)
+
+    Parameters
+    ----------
+    nb_classes   : int   – emotion classes (3 = SEED, 4 = SEED-IV)
+    Chans        : int   – EEG channels
+    Samples      : int   – time points per window
+    proj_hidden  : int   – projection head hidden width
+    proj_out     : int   – projection head output dimension
+    cls_max_norm : float – classification head weight constraint
+    **enc_kwargs         – passed directly to EEGNetEncoder
+                           (F1, D, F2, kernLength, dropoutRate)
+    """
+
+    def __init__(
+        self,
+        nb_classes   = 4,
+        Chans        = 62,
+        Samples      = 200,
+        proj_hidden  = 128,
+        proj_out     = 64,
+        cls_max_norm = 0.25,
+        **enc_kwargs,
+    ):
+        super().__init__()
+        self.encoder  = EEGNetEncoder(Chans=Chans, Samples=Samples, **enc_kwargs)
+        D             = enc_kwargs.get('embed_dim', self.encoder.embed_dim)
+        self.proj     = ProjectionHead(self.encoder.embed_dim, proj_hidden, proj_out)
+        self.cls_head = ClassificationHead(self.encoder.embed_dim, nb_classes,
+                                           max_norm_val=cls_max_norm)
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor, shape (B, 1, Chans, Samples)
+
+        Returns
+        -------
+        logits : (B, nb_classes) – for ClassificationLoss / accuracy
+        proj   : (B, proj_out)   – for ContrastiveLoss / ContrastivePrototype
+        """
+        z      = self.encoder(x)          # (B, embed_dim)
+        logits = self.cls_head(z)         # (B, nb_classes)
+        proj   = self.proj(z)             # (B, proj_out)
+        return logits, proj
+
+    def encode(self, x):
+        """Return raw encoder embedding (useful for t-SNE / evaluation)."""
+        return self.encoder(x)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  TRAINING UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BalancedBatchSampler(torch.utils.data.Sampler):
+    """
+    For each mini-batch, draw `n_per_class` samples from every class so
+    the contrastive losses always have sufficient positive pairs.
+
+    Parameters
+    ----------
+    labels       : 1-D tensor or list of integer class labels
+    n_per_class  : int – samples per class per batch   (≥ 2 recommended)
+    nb_classes   : int – total number of classes
+    """
+
+    def __init__(self, labels, n_per_class=8, nb_classes=4):
+        super().__init__(None)
+        self.labels      = torch.as_tensor(labels)
+        self.n_per_class = n_per_class
+        self.nb_classes  = nb_classes
+        self.batch_size  = n_per_class * nb_classes
+
+        # pre-compute per-class index lists
+        self.class_idx = [
+            (self.labels == c).nonzero(as_tuple=True)[0].tolist()
+            for c in range(nb_classes)
+        ]
+        # number of batches per epoch – limited by the smallest class
+        self.n_batches = min(len(idx) for idx in self.class_idx) // n_per_class
+
+    def __iter__(self):
+        # shuffle within each class at the start of every epoch
+        perm = [torch.randperm(len(idx)).tolist() for idx in self.class_idx]
+        ptr  = [0] * self.nb_classes
+
+        for _ in range(self.n_batches):
+            batch = []
+            for c in range(self.nb_classes):
+                chosen = perm[c][ptr[c]: ptr[c] + self.n_per_class]
+                batch += [self.class_idx[c][i] for i in chosen]
+                ptr[c] += self.n_per_class
+            yield batch
+
+    def __len__(self):
+        return self.n_batches
+
+
+class EEGDataset(torch.utils.data.Dataset):
+    """
+    Minimal dataset wrapper for pre-segmented EEG data.
+
+    Parameters
+    ----------
+    X          : np.ndarray or tensor, shape (N, Chans, Samples)
+                 Raw EEG segments. The channel dimension is added automatically.
+    y          : np.ndarray or tensor, shape (N,) – integer class labels
+    subject_id : np.ndarray or tensor, shape (N,) – subject index 0-14 (optional)
+    transform  : callable – optional per-sample augmentation
+    """
+
+    def __init__(self, X, y, subject_id=None, transform=None):
+        self.X          = torch.as_tensor(X, dtype=torch.float32)
+        self.y          = torch.as_tensor(y, dtype=torch.long)
+        self.subject_id = (torch.as_tensor(subject_id, dtype=torch.long)
+                           if subject_id is not None else None)
+        self.transform  = transform
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        # (Chans, Samples) → (1, Chans, Samples)
+        x = self.X[idx].unsqueeze(0)
+        if self.transform is not None:
+            x = self.transform(x)
+        if self.subject_id is not None:
+            return x, self.y[idx], self.subject_id[idx]
+        return x, self.y[idx]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  TRAINER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Trainer:
+    """
+    Handles the joint classification + contrastive training loop.
+
+    Parameters
+    ----------
+    model          : EEGNetContrastive
+    cls_loss_fn    : ClassificationLoss
+    con_loss_fn    : ContrastiveLoss  OR  ContrastivePrototype
+    optimizer      : torch.optim.Optimizer
+    lambda_con     : float – weight applied to the contrastive term (default 0.5)
+    warmup_epochs  : int   – epochs to train with contrastive loss only,
+                             before enabling classification loss (default 0)
+    device         : str   – 'cuda' or 'cpu'
+    scheduler      : optional LR scheduler (step called once per epoch)
+    """
+
+    def __init__(
+        self,
+        model,
+        cls_loss_fn,
+        con_loss_fn,
+        optimizer,
+        lambda_con    = 0.5,
+        warmup_epochs = 0,
+        device        = 'cuda',
+        scheduler     = None,
+    ):
+        self.model         = model.to(device)
+        self.cls_loss_fn   = cls_loss_fn
+        self.con_loss_fn   = con_loss_fn
+        self.optimizer     = optimizer
+        self.lambda_con    = lambda_con
+        self.warmup_epochs = warmup_epochs
+        self.device        = device
+        self.scheduler     = scheduler
+
+    # ── single epoch ──────────────────────────────────────────────────────
+
+    def _run_epoch(self, loader, train=True, epoch=0):
+        self.model.train(train)
+        total_loss = total_cls = total_con = correct = n = 0
+
+        ctx = torch.enable_grad() if train else torch.no_grad()
+        with ctx:
+            for batch in loader:
+                # unpack – subject_id is optional
+                if len(batch) == 3:
+                    x, labels, _ = batch
+                else:
+                    x, labels    = batch
+
+                x      = x.to(self.device)
+                labels = labels.to(self.device)
+
+                logits, proj = self.model(x)
+
+                # ── losses ────────────────────────────────────────────────
+                l_con = self.con_loss_fn(proj, labels)
+
+                if epoch < self.warmup_epochs:
+                    # contrastive warm-up: classification head not yet trained
+                    loss  = l_con
+                    l_cls = torch.tensor(0.0)
+                else:
+                    l_cls = self.cls_loss_fn(logits, labels)
+                    loss  = l_cls + self.lambda_con * l_con
+
+                # ── backward ──────────────────────────────────────────────
+                if train:
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    # gradient clipping – prevents occasional spikes with
+                    # contrastive loss when batches are imbalanced
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
+
+                # ── metrics ───────────────────────────────────────────────
+                bs          = x.size(0)
+                total_loss += loss.item()  * bs
+                total_cls  += l_cls.item() * bs
+                total_con  += l_con.item() * bs
+                correct    += (logits.argmax(1) == labels).sum().item()
+                n          += bs
+
+        return {
+            'loss'    : total_loss / n,
+            'cls_loss': total_cls  / n,
+            'con_loss': total_con  / n,
+            'acc'     : correct    / n,
+        }
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def fit(self, train_loader, val_loader=None, epochs=50):
+        """
+        Train for `epochs` epochs and return a history dict.
+
+        Returns
+        -------
+        history : dict with keys 'train', 'val' → lists of per-epoch metric dicts
+        """
+        history = {'train': [], 'val': []}
+
+        for epoch in range(1, epochs + 1):
+            tr = self._run_epoch(train_loader, train=True,  epoch=epoch)
+            history['train'].append(tr)
+
+            log = (f"Epoch {epoch:03d}/{epochs}  "
+                   f"train_loss={tr['loss']:.4f}  "
+                   f"cls={tr['cls_loss']:.4f}  "
+                   f"con={tr['con_loss']:.4f}  "
+                   f"acc={tr['acc']:.3f}")
+
+            if val_loader is not None:
+                va = self._run_epoch(val_loader, train=False, epoch=epoch)
+                history['val'].append(va)
+                log += (f"  |  val_loss={va['loss']:.4f}  "
+                        f"val_acc={va['acc']:.3f}")
+
+            print(log)
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+        return history
+
+    @torch.no_grad()
+    def evaluate(self, loader):
+        """Return metric dict for a given DataLoader (no gradient)."""
+        return self._run_epoch(loader, train=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  CONVENIENCE FACTORY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_model(
+    nb_classes   = 4,
+    Chans        = 62,
+    Samples      = 200,
+    F1           = 8,
+    D            = 2,
+    kernLength   = None,
+    dropoutRate  = 0.5,
+    proj_hidden  = 128,
+    proj_out     = 64,
+) -> EEGNetContrastive:
+    """
+    One-liner to instantiate the model with sensible defaults.
+
+    Typical usage
+    -------------
+        # SEED-IV, 1-second windows @ 200 Hz
+        model = build_model(nb_classes=4, Chans=62, Samples=200)
+
+        # SEED, 4-second windows @ 128 Hz
+        model = build_model(nb_classes=3, Chans=62, Samples=512)
+    """
+    return EEGNetContrastive(
+        nb_classes  = nb_classes,
+        Chans       = Chans,
+        Samples     = Samples,
+        proj_hidden = proj_hidden,
+        proj_out    = proj_out,
+        F1          = F1,
+        D           = D,
+        kernLength  = kernLength,
+        dropoutRate = dropoutRate,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  QUICK SMOKE-TEST  (python model.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    import sys
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Running smoke-test on {device}\n")
+
+    # ── build model ───────────────────────────────────────────────────────
+    model = build_model(nb_classes=4, Chans=62, Samples=200).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  embed_dim  : {model.encoder.embed_dim}")
+    print(f"  total params: {total_params:,}\n")
+
+    # ── fake batch ────────────────────────────────────────────────────────
+    B      = 32
+    x      = torch.randn(B, 1, 62, 200, device=device)
+    labels = torch.randint(0, 4, (B,), device=device)
+
+    logits, proj = model(x)
+    print(f"  logits shape : {tuple(logits.shape)}  (expected {B} x 4)")
+    print(f"  proj   shape : {tuple(proj.shape)}   (expected {B} x 64)\n")
+
+    # ── loss check ────────────────────────────────────────────────────────
+    # Import losses if available next to this file
+    try:
+        sys.path.insert(0, '.')
+        from losses import ClassificationLoss, ContrastiveLoss, ContrastivePrototype
+
+        cls_fn = ClassificationLoss()
+        con_fn = ContrastiveLoss(temperature=0.1)
+        cpr_fn = ContrastivePrototype(num_classes=4, temperature=0.1)
+
+        l_cls = cls_fn(logits, labels)
+        l_con = con_fn(proj, labels)
+        l_cpr = cpr_fn(proj, labels)
+        loss  = l_cls + 0.5 * l_con
+
+        print(f"  ClassificationLoss    : {l_cls.item():.4f}")
+        print(f"  ContrastiveLoss       : {l_con.item():.4f}")
+        print(f"  ContrastivePrototype  : {l_cpr.item():.4f}")
+        print(f"  Combined loss         : {loss.item():.4f}")
+
+        loss.backward()
+        print("\n  Backward pass OK ✓")
+
+    except ImportError:
+        print("  (losses.py not found – skipping loss check)")
+
+    # ── dataset + balanced sampler demo ───────────────────────────────────
+    import numpy as np
+    X_np    = np.random.randn(400, 62, 200).astype('float32')
+    y_np    = np.repeat(np.arange(4), 100)                   # 100 per class
+    subj_np = np.random.randint(0, 15, 400)
+
+    dataset = EEGDataset(X_np, y_np, subject_id=subj_np)
+    sampler = BalancedBatchSampler(y_np, n_per_class=8, nb_classes=4)
+    loader  = torch.utils.data.DataLoader(dataset, batch_sampler=sampler)
+
+    xb, yb, sb = next(iter(loader))
+    print(f"\n  BalancedBatch – x:{tuple(xb.shape)}  "
+          f"y:{tuple(yb.shape)}  subj:{tuple(sb.shape)}")
+    for c in range(4):
+        print(f"    class {c} count: {(yb == c).sum().item()}")
+
+    print("\nSmoke-test complete ✓")
