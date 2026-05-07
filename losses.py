@@ -27,7 +27,7 @@ class ClassificationLoss(nn.Module):
 
 class ContrastiveLoss(nn.Module):
     def __init__(self, temperature=0.1):
-        super.__init__()
+        super().__init__()
         self.tau = temperature
     
     def forward(self, features, labels):
@@ -46,11 +46,54 @@ class ContrastiveLoss(nn.Module):
         log_prob = torch.log(numerator + 1e-8) - torch.log(denominator + 1e-8)
 
         Pi_cardinality = pos_mask.sum(dim=1)
-        loss_per_anchor = -(pos_mask * log_prob).sum(dim=1) / Pi_cardinality
-        loss = loss_per_anchor[Pi_cardinality > 0].mean()
+        valid = Pi_cardinality > 0
+        loss_per_anchor = -(pos_mask[valid] * log_prob[valid]).sum(dim=1) / Pi_cardinality[valid]
+        loss = loss_per_anchor.mean()
 
         return loss
 
 # Contrastive-Prototype
+
+## For each class c, compute a prototype p_c by averaging the normalized embeddings of all samples in the batch with label c
+## then compare each sample embedding z_i to every class prototype-- pos, neg, and neutral
+## correct class prototype should have highest simmilarity
+
+## equation:
+## logits[i, c] = z_i dot p_c / tau
+## loss = CrossEntropyLoss(logits, labels)
+
+##features: tensor of shape [N, D]
+## N = batch size
+## D = embedding dimension
+## labels: tensor of shape [N]
+## class labels, should be integers from 0 to num_classes - 1
+
+class ConstrativePrototype(nn.Module):
+    def _init_(self, num_classes, temperature = 0.1):
+        super().__init__()
+        self.num_classes = num_classes
+        self.tau = temperature
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, features, labels):
+        device = features.device
+        Z = F.normalize(features, dim=1)
+        prototypes = []
+
+        for c in range(self.num_classes):
+            class_mask = labels == c
+            if class_mask.sum() == 0:
+                prototype = torch.zeros(Z.shape[1], device=device) ## 0 prototype of no features c found
+            else:
+                prototype = Z[class_mask].mean(dim=0)
+                prototype = F.normalize(prototype, dim=0)
+                
+            prototypes.append(prototype)
+        prototypes = torch.stack(prototypes, dim=0)
+        logits = torch.matmul(Z, prototypes.T) / self.tau
+        loss = self.loss_fn(logits, labels)
+        return loss
+        
+        
 
 # Leave-out Contrastive Prototype
