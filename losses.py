@@ -51,11 +51,6 @@ class ContrastiveLoss(nn.Module):
 
         return loss
 
-                
-
-
-
-
 # Contrastive-Prototype
 
 # Leave-out Contrastive Prototype
