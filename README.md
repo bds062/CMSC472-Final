@@ -32,6 +32,7 @@ project/
 |   |-- sweep_plots/
 |-- notebook/
 |   |-- data_processing.jpynb
+```
 
 
 ## Environment Setup
@@ -63,23 +64,27 @@ pip install -r requirements.txt
 ```
 
 
-## Data Setup
+## Data Format
 
 This project uses the SEED-IV pre-extracted EEG differential entropy features from the `eeg_feature_smooth` folder.
 
-Place the data in the following structure:
-
 ```text
-data/
-|-- eeg_feature_smooth/
-|   |-- 1/
-|   |-- 2/
-|   |-- 3/
+data/eeg_feature_smooth/
+|-- 1/
+|   |-- 1_20160518.mat
+|   |-- 2_20150915.mat
+|   |-- ...
+|-- 2/
+|-- 3/
 ```
 
-Each session folder should contain the `.mat` files for all subjects.
+Each `.mat` file contains keys such as:
 
-The dataloader expects each `.mat` file to contain `de_LDS` feature arrays with shape:
+```text
+de_LDS1, de_LDS2, ..., de_LDS24
+```
+
+Each trial array has shape:
 
 ```text
 (62, T, 5)
@@ -87,15 +92,37 @@ The dataloader expects each `.mat` file to contain `de_LDS` feature arrays with 
 
 where:
 
-- `62` = EEG channels
-- `T` = number of 4-second feature windows
+- `62` = EEG electrodes/channels
+- `T` = precomputed windows within the trial
 - `5` = frequency bands: delta, theta, alpha, beta, gamma
 
-Each window is converted into one model input of shape:
+A single model input sample is extracted as:
+
+```python
+arr[:, t, :]
+```
+
+with shape:
 
 ```text
 (62, 5)
 ```
+
+The dataloader then adds the Conv2d channel dimension, giving:
+
+```text
+(1, 62, 5)
+```
+
+So the model should be built with:
+
+```python
+build_model(nb_classes=4, Chans=62, Samples=5)
+```
+
+Here, `Samples=5` means frequency bands, not raw temporal samples.
+
+
 
 
 
