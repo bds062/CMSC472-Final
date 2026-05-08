@@ -446,8 +446,8 @@ class Trainer:
         self,
         model,
         cls_loss_fn,
-        con_loss_fn,
-        optimizer,
+        con_loss_fn    = None,
+        optimizer      = None,
         lambda_con    = 0.5,
         warmup_epochs = 0,
         device        = 'cuda',
@@ -483,15 +483,19 @@ class Trainer:
                 logits, proj = self.model(x)
 
                 # ── losses ────────────────────────────────────────────────
-                l_con = self.con_loss_fn(proj, labels)
-
-                if epoch <= self.warmup_epochs:
-                    # contrastive warm-up: classification head not yet trained
-                    loss  = l_con
-                    l_cls = torch.tensor(0.0)
+                if self.con_loss_fn is not None:
+                    l_con = self.con_loss_fn(proj, labels)
+                    if epoch <= self.warmup_epochs:
+                        # contrastive warm-up: classification head not yet trained
+                        l_cls = torch.tensor(0.0, device=self.device)
+                        loss  = l_con
+                    else:
+                        l_cls = self.cls_loss_fn(logits, labels)
+                        loss  = l_cls + self.lambda_con * l_con
                 else:
+                    l_con = torch.tensor(0.0, device=self.device)
                     l_cls = self.cls_loss_fn(logits, labels)
-                    loss  = l_cls + self.lambda_con * l_con
+                    loss  = l_cls
 
                 # ── backward ──────────────────────────────────────────────
                 if train:
@@ -543,7 +547,9 @@ class Trainer:
                 va = self._run_epoch(val_loader, train=False, epoch=epoch)
                 history['val'].append(va)
                 log += (f"  |  val_loss={va['loss']:.4f}  "
-                        f"val_acc={va['acc']:.3f}")
+                       f"val_cls={va['cls_loss']:.4f}  "
+                       f"val_con={va['con_loss']:.4f}  "
+                       f"val_acc={va['acc']:.3f}")
 
             print(log)
 
