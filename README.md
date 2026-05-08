@@ -27,34 +27,12 @@ project/
 |   |-- sweep.py
 |   |-- plot_sweep.py
 |   |-- model_training.jpynb
-
 |-- results/
 |   |-- checkpoints/
 |   |-- sweep_plots/
 |-- notebook/
 |   |-- data_processing.jpynb
 
-
-## Project Structure
-
-```text
-project/
-|-- README.md
-|-- requirements.txt
-|-- data/
-|-- src/
-|   |-- dataloader.py
-|   |-- losses.py
-|   |-- model.py
-|-- experiments/
-|   |-- run_experiment.py
-|   |-- sweep.py
-|   |-- plot_sweep.py
-|   |-- inspect_data.py
-|-- results/
-|   |-- checkpoints/
-|   |-- sweep_plots/
-```
 
 ## Environment Setup
 
@@ -83,5 +61,41 @@ Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
+
+
+## Data Setup
+
+This project uses the SEED-IV pre-extracted EEG differential entropy features from the `eeg_feature_smooth` folder.
+
+Place the data in the following structure:
+
+```text
+data/
+|-- eeg_feature_smooth/
+|   |-- 1/
+|   |-- 2/
+|   |-- 3/
+```
+
+Each session folder should contain the `.mat` files for all subjects.
+
+The dataloader expects each `.mat` file to contain `de_LDS` feature arrays with shape:
+
+```text
+(62, T, 5)
+```
+
+where:
+
+- `62` = EEG channels
+- `T` = number of 4-second feature windows
+- `5` = frequency bands: delta, theta, alpha, beta, gamma
+
+Each window is converted into one model input of shape:
+
+```text
+(62, 5)
+```
+
 
 
