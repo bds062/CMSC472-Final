@@ -130,13 +130,18 @@ class EEGNetEncoder(nn.Module):
         self.b1_bn1      = nn.BatchNorm2d(F1)
         self.b1_spatial  = _DepthwiseConv2d(F1, D, (Chans, 1), max_norm_val=1.0)
         self.b1_bn2      = nn.BatchNorm2d(F1 * D)
-        self.b1_pool     = nn.AvgPool2d((1, 4))
+        # Pool sizes scale with Samples so tiny inputs (e.g. Samples=5 DE features)
+        # don't collapse to zero. kernLength padding keeps width ≈ Samples after conv.
+        _after_b1 = max(1, Samples // 4)
+        _pool1    = min(4, max(1, Samples // 2))
+        _pool2    = min(8, max(1, _after_b1))
+        self.b1_pool     = nn.AvgPool2d((1, _pool1))
         self.b1_drop     = nn.Dropout(dropoutRate)
 
         # ── Block 2 ───────────────────────────────────────────────────────
         self.b2_sep      = _SeparableConv2d(F1 * D, F2, (1, 16), padding=(0, 8))
         self.b2_bn       = nn.BatchNorm2d(F2)
-        self.b2_pool     = nn.AvgPool2d((1, 8))
+        self.b2_pool     = nn.AvgPool2d((1, _pool2))
         self.b2_drop     = nn.Dropout(dropoutRate)
 
         # ── derive flat embedding size with a dry run ─────────────────────
@@ -352,7 +357,7 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
     """
 
     def __init__(self, labels, n_per_class=8, nb_classes=4):
-        super().__init__(None)
+        super().__init__()
         self.labels      = torch.as_tensor(labels)
         self.n_per_class = n_per_class
         self.nb_classes  = nb_classes
