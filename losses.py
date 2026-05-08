@@ -25,7 +25,7 @@ class ClassificationLoss(nn.Module):
 #### tau = temperature param to scale embeddings
 #### z_i dot z_p = calculating sim betw anchor and positive
 
-class ContrastiveLoss(nn.Module):
+class ContrastiveLearning(nn.Module):
     def __init__(self, temperature=0.1):
         super().__init__()
         self.tau = temperature
@@ -68,7 +68,7 @@ class ContrastiveLoss(nn.Module):
 ## labels: tensor of shape [N]
 ## class labels, should be integers from 0 to num_classes - 1
 
-class ConstrativePrototype(nn.Module):
+class ConstrativePrototypeLearning(nn.Module):
     def _init_(self, num_classes, temperature = 0.1):
         super().__init__()
         self.num_classes = num_classes
@@ -93,7 +93,13 @@ class ConstrativePrototype(nn.Module):
         logits = torch.matmul(Z, prototypes.T) / self.tau
         loss = self.loss_fn(logits, labels)
         return loss
-        
-        
-
+    
 # Leave-out Contrastive Prototype
+class LeaveOneOutContrastiveLearning(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.tau = temperature
+    
+    def forward(self, features, labels):
+        N = features.shape[0]
+        
