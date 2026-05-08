@@ -37,6 +37,7 @@ DATA_ROOT = "/fs/vulcan-projects/fsh_track/jason-bhargav-temp/CMSC472-Final/data
 DATASET = "SEED-IV"
 VAL_SUBJECT = 1
 NB_CLASSES = 4
+N_SUBJECTS = 15
 CLASS_NAMES = ["Neutral", "Sad", "Fear", "Happy"]
 
 CHANS = 62
@@ -50,6 +51,7 @@ LR = 1e-3
 WEIGHT_DECAY = 1e-4
 LAMBDA_CON = 0.5
 TEMPERATURE = 0.1
+EMA_ALPHA = 0.9
 WARMUP_EPOCHS = 0 if LOSS_MODE == "ce" else 5
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,9 +75,19 @@ def build_contrastive_loss(mode: str):
     if mode == "supcon":
         return ContrastiveLoss(temperature=TEMPERATURE)
     if mode == "prototype":
-        return PrototypeLoss(num_classes=NB_CLASSES, temperature=TEMPERATURE)
+        return PrototypeLoss(
+            num_classes=NB_CLASSES,
+            num_subjects=N_SUBJECTS,
+            temperature=TEMPERATURE,
+            ema_alpha=EMA_ALPHA,
+        )
     if mode == "sepc":
-        return SEPCLoss(num_classes=NB_CLASSES, temperature=TEMPERATURE)
+        return SEPCLoss(
+            num_classes=NB_CLASSES,
+            num_subjects=N_SUBJECTS,
+            temperature=TEMPERATURE,
+            ema_alpha=EMA_ALPHA,
+        )
     raise ValueError(f"Unknown LOSS_MODE: {mode}")
 
 
@@ -165,6 +177,7 @@ def main() -> None:
         "dataset": DATASET,
         "val_subject": VAL_SUBJECT,
         "nb_classes": NB_CLASSES,
+        "n_subjects": N_SUBJECTS,
         "chans": CHANS,
         "samples": SAMPLES,
         "loss_mode": LOSS_MODE,
@@ -174,6 +187,7 @@ def main() -> None:
         "weight_decay": WEIGHT_DECAY,
         "lambda_con": LAMBDA_CON,
         "temperature": TEMPERATURE,
+        "ema_alpha": EMA_ALPHA,
         "warmup_epochs": WARMUP_EPOCHS,
         "seed": SEED,
         "device": DEVICE,
@@ -189,6 +203,7 @@ def main() -> None:
         leave_one_out=True,
         augment_train=True,
         seed=SEED,
+        n_subjects=N_SUBJECTS,
     )
 
     model = build_model(nb_classes=NB_CLASSES, Chans=CHANS, Samples=SAMPLES)
