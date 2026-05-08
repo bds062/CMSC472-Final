@@ -122,7 +122,94 @@ build_model(nb_classes=4, Chans=62, Samples=5)
 
 Here, `Samples=5` means frequency bands, not raw temporal samples.
 
+### 2. Run a single training experiment
 
+Cross-entropy baseline:
 
+```bash
+python experiments/run_experiment.py --loss_type ce --epochs 100
+```
 
+Supervised contrastive learning:
 
+```bash
+python experiments/run_experiment.py --loss_type contrastive --epochs 100 --temperature 0.1 --lambda_contrastive 0.5
+```
+
+Global prototype contrast:
+
+```bash
+python experiments/run_experiment.py --loss_type prototype --epochs 100 --temperature 0.1 --lambda_contrastive 0.5
+```
+
+Leave-one-out / SEPC-style contrastive run:
+
+```bash
+python experiments/run_experiment.py --loss_type leave_one_out --epochs 100 --temperature 0.1 --lambda_contrastive 0.5
+```
+
+Outputs are saved under:
+
+```text
+results/checkpoints/
+```
+
+Each run saves training curves, validation metrics, and confusion matrices.
+
+## Reproducing Main Results
+
+All commands should be run from the project root.
+
+### 1. Inspect the dataset
+
+```bash
+python experiments/inspect_data.py
+```
+
+This checks that the SEED-IV files are in the expected location and verifies the feature shapes.
+
+### 3. Run the hyperparameter sweep
+
+```bash
+python experiments/sweep.py
+```
+
+This runs the sweep over loss types and hyperparameters used for the main comparison in the report.
+
+### 4. Generate sweep plots
+
+```bash
+python experiments/plot_sweep.py
+```
+
+This generates the plots used in the report, including loss-type comparisons, learning-rate effects, and top-run summaries.
+
+Plots are saved under:
+
+```text
+results/sweep_plots/
+```
+
+## Expected Runtime and Hardware
+
+Training time varies by loss function and sweep size. On our setup, a single 100-epoch training run takes approximately 10 minutes. Cross-entropy runs are usually the fastest, while contrastive, prototype, and leave-one-out objectives can take longer because they compute additional embedding similarities or prototype-based losses.
+
+Approximate runtime:
+
+```text
+Single 100-epoch run: ~10 minutes
+Small hyperparameter sweep: varies by number of configurations
+Full sweep: number of runs x ~10 minutes per run
+```
+
+Recommended hardware:
+
+```text
+GPU recommended
+Tested with a single GPU environment
+CPU training is possible but slower
+```
+
+## Notes
+
+anything else to add like how u processed the data etc
