@@ -1,5 +1,5 @@
 """
-model.py
+model.py 
 EEGNet re-implemented in PyTorch with dual-head architecture for joint
 classification + contrastive learning (SupCon / Contrastive-Prototype).
 
