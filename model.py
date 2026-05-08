@@ -485,7 +485,7 @@ class Trainer:
                 # ── losses ────────────────────────────────────────────────
                 l_con = self.con_loss_fn(proj, labels)
 
-                if epoch < self.warmup_epochs:
+                if epoch <= self.warmup_epochs:
                     # contrastive warm-up: classification head not yet trained
                     loss  = l_con
                     l_cls = torch.tensor(0.0)
