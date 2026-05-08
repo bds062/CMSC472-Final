@@ -22,6 +22,7 @@ project/
 |   |-- dataloader.py
 |   |-- losses.py
 |   |-- model.py
+|   |-- debug_mat.py
 |-- experiments/
 |   |-- run_experiment.py
 |   |-- sweep.py
@@ -30,3 +31,57 @@ project/
 |-- results/
 |   |-- checkpoints/
 |   |-- sweep_plots/
+|-- notebook/
+|   |-- data_processing.jnpy
+
+
+## Project Structure
+
+```text
+project/
+|-- README.md
+|-- requirements.txt
+|-- data/
+|-- src/
+|   |-- dataloader.py
+|   |-- losses.py
+|   |-- model.py
+|-- experiments/
+|   |-- run_experiment.py
+|   |-- sweep.py
+|   |-- plot_sweep.py
+|   |-- inspect_data.py
+|-- results/
+|   |-- checkpoints/
+|   |-- sweep_plots/
+```
+
+## Environment Setup
+
+We recommend using Python 3.10 or later.
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+```
+
+On macOS/Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+On Windows:
+
+```bash
+.venv\Scripts\activate
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+
