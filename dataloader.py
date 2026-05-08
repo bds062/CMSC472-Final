@@ -287,10 +287,20 @@ def build_loaders(
     augment_train : bool  = True,
     val_sessions  : list  = None,
     feature       : str   = 'de_LDS',
-    **kwargs,                          # absorbs legacy args: window_sec, sfreq, etc.
+    leave_one_out : bool  = True,    # ← new flag
+    val_fraction  : float = 0.15,    # ← fraction per subject held out when LOO=False
+    n_subjects    : int   = 15,
+    **kwargs,
 ) -> tuple:
     """
     Load SEED-IV DE features and return (train_loader, val_loader).
+
+    leave_one_out=True  : original behaviour — one subject is held out entirely
+                          as the validation set (cross-subject generalisation).
+
+    leave_one_out=False : val set is built by drawing `val_fraction` of windows
+                          from EVERY subject, so all subjects appear in both
+                          train and val (within-distribution evaluation).
 
     NOTE: samples have shape (62, 5).
     Build the model with:   build_model(nb_classes=4, Chans=62, Samples=5)
@@ -298,21 +308,52 @@ def build_loaders(
     nb_classes = 4 if dataset == 'SEED-IV' else 3
     load_kw    = dict(feature=feature)
 
-    print(f"\nBuilding loaders  [{strategy}]  dataset={dataset}  feature={feature}")
+    print(f"\nBuilding loaders  [LOO={leave_one_out}]  strategy={strategy}  "
+          f"dataset={dataset}  feature={feature}")
 
-    if strategy == 'cross_subject':
-        X_tr, y_tr, s_tr, X_va, y_va, s_va = cross_subject_split(
-            data_root, val_subject=val_subject, dataset=dataset, **load_kw
-        )
-    elif strategy == 'within_subject':
-        X_tr, y_tr, s_tr, X_va, y_va, s_va = within_subject_split(
-            data_root, subject_id=subject_id, dataset=dataset,
-            val_sessions=val_sessions, **load_kw
-        )
+    # ── data loading ──────────────────────────────────────────────────────
+    if leave_one_out:
+        # original behaviour
+        if strategy == 'cross_subject':
+            X_tr, y_tr, s_tr, X_va, y_va, s_va = cross_subject_split(
+                data_root, val_subject=val_subject, dataset=dataset,
+                n_subjects=n_subjects, **load_kw
+            )
+        elif strategy == 'within_subject':
+            X_tr, y_tr, s_tr, X_va, y_va, s_va = within_subject_split(
+                data_root, subject_id=subject_id, dataset=dataset,
+                val_sessions=val_sessions, **load_kw
+            )
+        else:
+            raise ValueError(f"Unknown strategy '{strategy}'.")
+
     else:
-        raise ValueError(f"Unknown strategy '{strategy}'.")
+        # draw val_fraction of windows from every subject
+        X_tr, y_tr, s_tr = [], [], []
+        X_va, y_va, s_va = [], [], []
 
-    # normalise (fit on train only)
+        for sid in range(1, n_subjects + 1):
+            print(f"  Loading subject {sid:02d}/{n_subjects} …", end=' ', flush=True)
+            X, y = load_subject_data(data_root, sid, dataset=dataset, **load_kw)
+            s    = np.full(len(y), sid - 1, dtype=np.int64)
+            print(f"{len(y)} windows")
+
+            # stratified split — preserve class balance within each subject
+            from sklearn.model_selection import train_test_split as _tts
+            idx_tr, idx_va = _tts(
+                np.arange(len(y)),
+                test_size    = val_fraction,
+                stratify     = y,
+                random_state = 42,
+            )
+
+            X_tr.append(X[idx_tr]); y_tr.append(y[idx_tr]); s_tr.append(s[idx_tr])
+            X_va.append(X[idx_va]); y_va.append(y[idx_va]); s_va.append(s[idx_va])
+
+        X_tr = np.concatenate(X_tr); y_tr = np.concatenate(y_tr); s_tr = np.concatenate(s_tr)
+        X_va = np.concatenate(X_va); y_va = np.concatenate(y_va); s_va = np.concatenate(s_va)
+
+    # ── normalise (fit on train only) ─────────────────────────────────────
     norm = ChannelNormalizer()
     X_tr = norm.fit_transform(X_tr)
     X_va = norm.transform(X_va)
@@ -320,17 +361,17 @@ def build_loaders(
     print(f"\n  Train : {X_tr.shape}  labels {np.bincount(y_tr)}")
     print(f"  Val   : {X_va.shape}  labels {np.bincount(y_va)}")
 
-    # augmentations
+    # ── augmentations ─────────────────────────────────────────────────────
     train_transform = (
         ComposeTransforms([GaussianNoise(std=0.05), FreqBandDropout(p=0.2)])
         if augment_train else None
     )
 
-    # datasets
+    # ── datasets ──────────────────────────────────────────────────────────
     train_ds = EEGDataset(X_tr, y_tr, subject_id=s_tr, transform=train_transform)
     val_ds   = EEGDataset(X_va, y_va, subject_id=s_va)
 
-    # balanced sampler for training (ensures ≥2 samples/class for contrastive loss)
+    # ── samplers & loaders ────────────────────────────────────────────────
     train_sampler = BalancedBatchSampler(
         y_tr, n_per_class=n_per_class, nb_classes=nb_classes
     )
