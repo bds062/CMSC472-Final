@@ -41,7 +41,7 @@ class ContrastiveLearning(nn.Module):
 
         zi_DOT_za = torch.mm(Z, Z.T) / self.tau
         zi_DOT_za_stable = zi_DOT_za - zi_DOT_za.max(dim=1, keepdim=True).values.detach()
-        denominator = torch.exp(zi_DOT_za_stable).masked_fill_(self_mask, 0).sum(dim=1, keepdim=True)
+        denominator = torch.exp(zi_DOT_za_stable).masked_fill(self_mask, 0).sum(dim=1, keepdim=True)
         numerator = torch.exp(zi_DOT_za_stable).masked_fill(~pos_mask.bool(), 0)
         log_prob = torch.log(numerator + 1e-8) - torch.log(denominator + 1e-8)
 
