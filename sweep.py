@@ -5,10 +5,14 @@ Grid sweep for the corrected EEGNet-style DE-feature pipeline.
 
 This version matches the corrected loss/model code:
   - CE-only, SupCon, Prototype, and SEPC are all supported.
-  - SEPC receives subject_ids through Trainer.
+  - Prototype and SEPC use per-subject-class EMA prototypes.
   - CE-only runs do not use contrastive warmup or lambda_con.
   - Resumed runs preserve the global epoch count, so warmup is not restarted.
   - The default evaluation is held-out-subject validation.
+
+Note: EMA prototype state is *not* checkpointed. If a run resumes from a
+partial checkpoint, prototypes will re-warm over the first few batches.
+This has negligible effect on final results.
 
 Usage:
     python sweep.py
@@ -45,6 +49,7 @@ from model import build_model, Trainer
 # Fixed config
 # ----------------------------
 NB_CLASSES = 4
+N_SUBJECTS = 15
 CHANS = 62
 SAMPLES = 5  # DE frequency bands, not raw time points.
 EPOCHS = 50
@@ -56,6 +61,7 @@ DATA_ROOT = "/fs/vulcan-projects/fsh_track/jason-bhargav-temp/CMSC472-Final/data
 DATASET = "SEED-IV"
 N_PER_CLASS = 8
 SEED = 42
+EMA_ALPHA = 0.9
 
 
 # ----------------------------
@@ -84,9 +90,19 @@ def make_loss(loss_type: str, temperature: float):
     if loss_type == "supcon":
         return ContrastiveLoss(temperature=temperature)
     if loss_type == "prototype":
-        return PrototypeLoss(num_classes=NB_CLASSES, temperature=temperature)
+        return PrototypeLoss(
+            num_classes=NB_CLASSES,
+            num_subjects=N_SUBJECTS,
+            temperature=temperature,
+            ema_alpha=EMA_ALPHA,
+        )
     if loss_type == "sepc":
-        return SEPCLoss(num_classes=NB_CLASSES, temperature=temperature)
+        return SEPCLoss(
+            num_classes=NB_CLASSES,
+            num_subjects=N_SUBJECTS,
+            temperature=temperature,
+            ema_alpha=EMA_ALPHA,
+        )
     raise ValueError(f"Unknown loss_type: {loss_type}")
 
 
@@ -311,6 +327,7 @@ def run_sweep(start_idx: int = 1, val_subject: int = 1) -> list[dict]:
         leave_one_out=True,
         augment_train=True,
         seed=SEED,
+        n_subjects=N_SUBJECTS,
     )
     print("Data loaders ready.\n")
 
