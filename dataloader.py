@@ -1,399 +1,464 @@
 """
 dataloader.py
-─────────────
-Loads SEED-IV eeg_feature_smooth data (pre-extracted DE features).
 
-Data format inside each .mat file:
-  de_LDS{1..24}  : shape (62, T, 5)
-    62  – EEG channels
-    T   – pre-computed 4-second windows (varies per trial, ~12–64)
-    5   – frequency bands: delta, theta, alpha, beta, gamma
+Dataloader for SEED / SEED-IV pre-extracted DE-LDS EEG features.
 
-Each trial window becomes one sample: shape (62, 5)
-  → model should be built with Chans=62, Samples=5
+For SEED-IV eeg_feature_smooth files, each trial key such as de_LDS1 has shape
+(62, T, 5):
+  - 62 = EEG electrodes
+  - T  = trial windows
+  - 5  = DE frequency bands: delta, theta, alpha, beta, gamma
 
-Folder layout:
-  data/eeg_feature_smooth/
-    1/                         ← session 1
-      1_20160518.mat           ← subject 1
-      2_20150915.mat           ← subject 2
-      ...
-    2/  3/  ...
+Each model sample is therefore a spatial-spectral matrix of shape (62, 5).
+Build the model with:
+    build_model(nb_classes=4, Chans=62, Samples=5)
 
-Quick-start
-───────────
-    from dataloader import build_loaders
-
-    train_loader, val_loader = build_loaders(
-        data_root   = '/path/to/CMSC472-Final/data',
-        val_subject = 1,
-        dataset     = 'SEED-IV',
-    )
-    # then build model with Chans=62, Samples=5
+This file avoids the most common evaluation leak:
+  - For cross-subject evaluation, a full subject is held out.
+  - For non-LOO sanity checks, splitting is trial-level, not window-level.
 """
 
+from __future__ import annotations
+
 import os
+from dataclasses import dataclass
+from typing import Callable, Optional
+
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from model import EEGDataset, BalancedBatchSampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SEED-IV emotion label maps
-# ─────────────────────────────────────────────────────────────────────────────
-
-# 0=neutral  1=sad  2=fear  3=happy
 SEED_IV_LABELS = {
-    1: [1,2,3,0,2,0,0,1,0,1,2,1,1,1,2,3,2,2,3,3,0,3,0,3],
-    2: [2,1,3,0,0,2,0,2,3,3,2,3,2,0,1,1,2,1,0,3,0,1,3,1],
-    3: [1,2,2,1,3,3,3,1,1,2,1,0,2,3,3,0,2,3,0,0,2,0,1,0],
+    # 0=neutral, 1=sad, 2=fear, 3=happy
+    1: [1, 2, 3, 0, 2, 0, 0, 1, 0, 1, 2, 1, 1, 1, 2, 3, 2, 2, 3, 3, 0, 3, 0, 3],
+    2: [2, 1, 3, 0, 0, 2, 0, 2, 3, 3, 2, 3, 2, 0, 1, 1, 2, 1, 0, 3, 0, 1, 3, 1],
+    3: [1, 2, 2, 1, 3, 3, 3, 1, 1, 2, 1, 0, 2, 3, 3, 0, 2, 3, 0, 0, 2, 0, 1, 0],
 }
 
-# 0=negative  1=neutral  2=positive
 SEED_LABELS = {
-    1: [1,0,2,0,1,1,2,0,1,2,2,1,0,2,0],
-    2: [2,1,0,0,2,1,1,2,0,2,1,2,0,1,0],
-    3: [1,2,0,1,2,0,1,2,0,1,2,0,1,2,0],
+    # 0=negative, 1=neutral, 2=positive
+    1: [1, 0, 2, 0, 1, 1, 2, 0, 1, 2, 2, 1, 0, 2, 0],
+    2: [2, 1, 0, 0, 2, 1, 1, 2, 0, 2, 1, 2, 0, 1, 0],
+    3: [1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0],
 }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  .mat loader
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _load_mat(path: str) -> dict:
-    """Load .mat file (scipy for <v7.3, h5py for v7.3+)."""
+    """Load a MATLAB file using scipy for v7.2 or h5py for v7.3."""
     import scipy.io as sio
+
     try:
         return sio.loadmat(path)
-    except Exception:
-        try:
-            import h5py
-            with h5py.File(path, 'r') as f:
-                return {k: np.array(v) for k, v in f.items()
-                        if not k.startswith('#')}
-        except ImportError:
-            raise ImportError("pip install h5py  (needed for MATLAB v7.3 files)")
+    except NotImplementedError:
+        import h5py
+
+        out = {}
+        with h5py.File(path, "r") as f:
+            for k in f.keys():
+                if not k.startswith("#"):
+                    out[k] = np.array(f[k])
+        return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  Per-subject loader
-# ─────────────────────────────────────────────────────────────────────────────
+def _numeric_suffix(key: str, prefix: str) -> int:
+    suffix = key.replace(prefix, "")
+    return int(suffix) if suffix else 0
+
+
+@dataclass
+class LoadedSubject:
+    X: np.ndarray          # (N, 62, 5)
+    y: np.ndarray          # (N,)
+    subject_id: np.ndarray # (N,)
+    trial_id: np.ndarray   # (N,), unique within subject/session/trial
+
 
 def load_subject_data(
-    data_root  : str,
-    subject_id : int,           # 1-indexed (1 … 15)
-    dataset    : str = 'SEED-IV',
-    sessions   : list = None,   # None → all 3
-    feature    : str = 'de_LDS',  # prefix of mat keys to use
-) -> tuple:
+    data_root: str,
+    subject_id: int,
+    dataset: str = "SEED-IV",
+    sessions: Optional[list[int]] = None,
+    feature: str = "de_LDS",
+) -> LoadedSubject:
     """
-    Load pre-extracted DE features for one subject.
+    Load all windows for one subject.
 
-    Each trial array has shape (62, T, 5).
-    We yield T samples per trial, each of shape (62, 5):
-        axis-0 (62) = EEG channels
-        axis-1  (5) = freq bands [delta, theta, alpha, beta, gamma]
-
-    Returns
-    -------
-    X : np.ndarray  (N, 62, 5)   float32
-    y : np.ndarray  (N,)          int64
+    subject_id is 1-indexed, matching file prefixes in the SEED directories.
+    Returned subject_id is 0-indexed for model/loss use.
     """
-    label_map = SEED_IV_LABELS if dataset == 'SEED-IV' else SEED_LABELS
-    sessions  = sessions or [1, 2, 3]
+    if dataset not in {"SEED", "SEED-IV"}:
+        raise ValueError("dataset must be 'SEED' or 'SEED-IV'.")
 
-    all_X, all_y = [], []
+    label_map = SEED_IV_LABELS if dataset == "SEED-IV" else SEED_LABELS
+    sessions = sessions or [1, 2, 3]
+
+    Xs, ys, ss, tids = [], [], [], []
 
     for sess in sessions:
-        # session is the directory; subject_id is the file prefix
-        sess_dir = os.path.join(data_root, 'eeg_feature_smooth', str(sess))
-
+        sess_dir = os.path.join(data_root, "eeg_feature_smooth", str(sess))
         if not os.path.isdir(sess_dir):
-            print(f"  [warn] session dir missing: {sess_dir}")
+            print(f"[warn] missing session directory: {sess_dir}")
             continue
 
-        candidates = [
+        candidates = sorted(
             f for f in os.listdir(sess_dir)
-            if f.startswith(f'{subject_id}_') and f.endswith('.mat')
-        ]
+            if f.startswith(f"{subject_id}_") and f.endswith(".mat")
+        )
         if not candidates:
-            print(f"  [warn] no .mat for subject {subject_id} session {sess}")
+            print(f"[warn] no .mat file for subject {subject_id}, session {sess}")
             continue
 
         mat_path = os.path.join(sess_dir, candidates[0])
         mat_data = _load_mat(mat_path)
-        labels   = label_map[sess]
+        labels = label_map[sess]
 
-        # pick keys like de_LDS1, de_LDS2, … de_LDS24  (sorted numerically)
         trial_keys = sorted(
-            [k for k in mat_data if k.startswith(feature)],
-            key=lambda k: int(k.replace(feature, '') or 0)
+            [k for k in mat_data.keys() if k.startswith(feature)],
+            key=lambda k: _numeric_suffix(k, feature),
         )
 
         for trial_idx, key in enumerate(trial_keys):
             if trial_idx >= len(labels):
                 break
 
-            arr = np.array(mat_data[key], dtype=np.float32)  # (62, T, 5)
+            arr = np.array(mat_data[key], dtype=np.float32)
+
+            # Expected shape for scipy loadmat is (62, T, 5).
+            # If a v7.3 file is encountered, dimensions can occasionally be reversed.
+            if arr.ndim == 3 and arr.shape[-1] == 62 and arr.shape[0] == 5:
+                arr = np.transpose(arr, (2, 1, 0))
+
             if arr.ndim != 3 or arr.shape[0] != 62 or arr.shape[2] != 5:
-                continue                     # skip unexpected shapes
+                print(f"[warn] skipping unexpected array {key}: shape={arr.shape}")
+                continue
 
-            # (62, T, 5) → T samples each of shape (62, 5)
-            T = arr.shape[1]
-            for t in range(T):
-                all_X.append(arr[:, t, :])  # (62, 5)
-                all_y.append(labels[trial_idx])
+            label = labels[trial_idx]
+            global_trial_id = (subject_id - 1) * 10_000 + sess * 100 + trial_idx
 
-    if not all_X:
+            for t in range(arr.shape[1]):
+                Xs.append(arr[:, t, :])  # (62, 5)
+                ys.append(label)
+                ss.append(subject_id - 1)
+                tids.append(global_trial_id)
+
+    if not Xs:
         raise RuntimeError(
-            f"No data loaded for subject {subject_id}. "
-            "Check data_root and folder layout."
+            f"No data loaded for subject {subject_id}. Check data_root, dataset, and feature."
         )
 
-    X = np.stack(all_X).astype(np.float32)  # (N, 62, 5)
-    y = np.array(all_y, dtype=np.int64)      # (N,)
-    return X, y
+    return LoadedSubject(
+        X=np.stack(Xs).astype(np.float32),
+        y=np.asarray(ys, dtype=np.int64),
+        subject_id=np.asarray(ss, dtype=np.int64),
+        trial_id=np.asarray(tids, dtype=np.int64),
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Normalisation
-# ─────────────────────────────────────────────────────────────────────────────
+class ChannelBandNormalizer:
+    """
+    Z-score per electrode and frequency band.
 
-class ChannelNormalizer:
-    """Z-score per channel. Fit on train, apply to val/test."""
+    For DE features, normalizing per (channel, band) is cleaner than collapsing
+    across all five bands, because the bands have different scales.
+    """
+    def __init__(self) -> None:
+        self.mean_: Optional[np.ndarray] = None
+        self.std_: Optional[np.ndarray] = None
 
-    def __init__(self):
-        self.mean_ = None  # (1, 62, 1)
-        self.std_  = None
-
-    def fit(self, X: np.ndarray):
-        # X : (N, 62, 5)
-        self.mean_ = X.mean(axis=(0, 2), keepdims=True)
-        self.std_  = X.std(axis=(0, 2),  keepdims=True).clip(min=1e-8)
+    def fit(self, X: np.ndarray) -> "ChannelBandNormalizer":
+        self.mean_ = X.mean(axis=0, keepdims=True)              # (1, 62, 5)
+        self.std_ = X.std(axis=0, keepdims=True).clip(min=1e-8) # (1, 62, 5)
         return self
 
-    def transform(self, X):
-        return (X - self.mean_) / self.std_
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        if self.mean_ is None or self.std_ is None:
+            raise RuntimeError("Normalizer must be fit before transform.")
+        return ((X - self.mean_) / self.std_).astype(np.float32)
 
-    def fit_transform(self, X):
+    def fit_transform(self, X: np.ndarray) -> np.ndarray:
         return self.fit(X).transform(X)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  Augmentations
-# ─────────────────────────────────────────────────────────────────────────────
-
 class GaussianNoise:
-    def __init__(self, std=0.05):
+    def __init__(self, std: float = 0.05) -> None:
         self.std = std
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return x + torch.randn_like(x) * self.std
 
+
 class FreqBandDropout:
-    """Randomly zero out one frequency band."""
-    def __init__(self, p=0.2):
+    """Randomly zero out one DE frequency band."""
+    def __init__(self, p: float = 0.2) -> None:
         self.p = p
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (1, 62, 5)
         if torch.rand(1).item() < self.p:
-            band = torch.randint(0, 5, (1,)).item()
+            band = torch.randint(0, x.shape[-1], (1,)).item()
             x = x.clone()
             x[..., band] = 0.0
         return x
 
-class TemporalShift:
-    """No-op for pre-extracted features (kept for import compatibility)."""
-    def __init__(self, max_shift=10):
-        self.max_shift = max_shift
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return x
 
 class ComposeTransforms:
-    def __init__(self, transforms):
+    def __init__(self, transforms: list[Callable[[torch.Tensor], torch.Tensor]]) -> None:
         self.transforms = transforms
-    def __call__(self, x):
-        for t in self.transforms:
-            x = t(x)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        for transform in self.transforms:
+            x = transform(x)
         return x
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  Split strategies
-# ─────────────────────────────────────────────────────────────────────────────
+class EEGDataset(Dataset):
+    """
+    Dataset wrapper for pre-extracted DE feature samples.
 
-def cross_subject_split(
-    data_root   : str,
-    val_subject : int,
-    dataset     : str = 'SEED-IV',
-    n_subjects  : int = 15,
-    **load_kwargs,
-) -> tuple:
-    """Hold out one subject for validation; train on all others."""
-    train_X, train_y, train_s = [], [], []
-    val_X,   val_y,   val_s   = [], [], []
+    X shape: (N, 62, 5).
+    __getitem__ returns x with shape (1, 62, 5), plus label and subject_id.
+    """
+    def __init__(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        subject_id: np.ndarray,
+        transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> None:
+        self.X = torch.as_tensor(X, dtype=torch.float32)
+        self.y = torch.as_tensor(y, dtype=torch.long)
+        self.subject_id = torch.as_tensor(subject_id, dtype=torch.long)
+        self.transform = transform
 
-    for sid in range(1, n_subjects + 1):
-        print(f"  Loading subject {sid:02d}/{n_subjects} …", end=' ', flush=True)
-        X, y = load_subject_data(data_root, sid, dataset=dataset, **load_kwargs)
-        s    = np.full(len(y), sid - 1, dtype=np.int64)
-        print(f"{len(y)} windows")
+    def __len__(self) -> int:
+        return len(self.y)
 
-        if sid == val_subject:
-            val_X.append(X);   val_y.append(y);   val_s.append(s)
-        else:
-            train_X.append(X); train_y.append(y); train_s.append(s)
+    def __getitem__(self, idx: int):
+        x = self.X[idx].unsqueeze(0)  # (1, 62, 5)
+        if self.transform is not None:
+            x = self.transform(x)
+        return x, self.y[idx], self.subject_id[idx]
 
-    return (
-        np.concatenate(train_X), np.concatenate(train_y), np.concatenate(train_s),
-        np.concatenate(val_X),   np.concatenate(val_y),   np.concatenate(val_s),
+
+class BalancedBatchSampler(Sampler[list[int]]):
+    """
+    Draw n_per_class examples from each class per batch.
+
+    This is useful for supervised contrastive learning because each batch is
+    likely to contain positives for each class.
+    """
+    def __init__(
+        self,
+        labels: np.ndarray | torch.Tensor,
+        n_per_class: int = 8,
+        nb_classes: int = 4,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.labels = torch.as_tensor(labels, dtype=torch.long)
+        self.n_per_class = n_per_class
+        self.nb_classes = nb_classes
+        self.batch_size = n_per_class * nb_classes
+        self.seed = seed
+        self.epoch = 0
+
+        self.class_idx = [
+            (self.labels == c).nonzero(as_tuple=True)[0].tolist()
+            for c in range(nb_classes)
+        ]
+        empty = [c for c, idx in enumerate(self.class_idx) if len(idx) == 0]
+        if empty:
+            raise ValueError(f"No samples for classes {empty}; cannot build balanced batches.")
+
+        self.n_batches = min(len(idx) for idx in self.class_idx) // n_per_class
+
+    def __iter__(self):
+        generator = torch.Generator()
+        if self.seed is not None:
+            generator.manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+
+        perms = [torch.randperm(len(idx), generator=generator).tolist() for idx in self.class_idx]
+        ptr = [0] * self.nb_classes
+
+        for _ in range(self.n_batches):
+            batch = []
+            for c in range(self.nb_classes):
+                chosen = perms[c][ptr[c]: ptr[c] + self.n_per_class]
+                batch.extend(self.class_idx[c][j] for j in chosen)
+                ptr[c] += self.n_per_class
+            yield batch
+
+    def __len__(self) -> int:
+        return self.n_batches
+
+
+def _concat(subjects: list[LoadedSubject]) -> LoadedSubject:
+    return LoadedSubject(
+        X=np.concatenate([s.X for s in subjects], axis=0),
+        y=np.concatenate([s.y for s in subjects], axis=0),
+        subject_id=np.concatenate([s.subject_id for s in subjects], axis=0),
+        trial_id=np.concatenate([s.trial_id for s in subjects], axis=0),
     )
 
 
-def within_subject_split(
-    data_root    : str,
-    subject_id   : int,
-    val_sessions : list = None,
-    dataset      : str  = 'SEED-IV',
-    **load_kwargs,
-) -> tuple:
-    """Train on sessions 1–2, validate on session 3 (default)."""
-    val_sessions   = val_sessions or [3]
-    train_sessions = [s for s in [1, 2, 3] if s not in val_sessions]
+def cross_subject_split(
+    data_root: str,
+    val_subject: int,
+    dataset: str = "SEED-IV",
+    n_subjects: int = 15,
+    feature: str = "de_LDS",
+) -> tuple[LoadedSubject, LoadedSubject]:
+    """Train on all subjects except val_subject; validate on val_subject."""
+    train_subjects, val_subjects = [], []
 
-    X_tr, y_tr = load_subject_data(data_root, subject_id, dataset=dataset,
-                                    sessions=train_sessions, **load_kwargs)
-    X_va, y_va = load_subject_data(data_root, subject_id, dataset=dataset,
-                                    sessions=val_sessions, **load_kwargs)
+    for sid in range(1, n_subjects + 1):
+        print(f"Loading subject {sid:02d}/{n_subjects} ...", end=" ", flush=True)
+        subj = load_subject_data(data_root, sid, dataset=dataset, feature=feature)
+        print(f"{len(subj.y)} windows")
+        if sid == val_subject:
+            val_subjects.append(subj)
+        else:
+            train_subjects.append(subj)
 
-    s_tr = np.full(len(y_tr), subject_id - 1, dtype=np.int64)
-    s_va = np.full(len(y_va), subject_id - 1, dtype=np.int64)
-    return X_tr, y_tr, s_tr, X_va, y_va, s_va
+    return _concat(train_subjects), _concat(val_subjects)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  Main factory
-# ─────────────────────────────────────────────────────────────────────────────
+def trial_level_mixed_subject_split(
+    data_root: str,
+    dataset: str = "SEED-IV",
+    n_subjects: int = 15,
+    feature: str = "de_LDS",
+    val_fraction: float = 0.15,
+    seed: int = 42,
+) -> tuple[LoadedSubject, LoadedSubject]:
+    """
+    Mixed-subject sanity-check split.
+
+    This is not the main cross-subject protocol. It splits by whole trials within
+    each subject so that windows from the same trial are not split across train/val.
+    """
+    rng = np.random.default_rng(seed)
+    train_parts, val_parts = [], []
+
+    for sid in range(1, n_subjects + 1):
+        print(f"Loading subject {sid:02d}/{n_subjects} ...", end=" ", flush=True)
+        subj = load_subject_data(data_root, sid, dataset=dataset, feature=feature)
+        print(f"{len(subj.y)} windows")
+
+        train_mask = np.zeros(len(subj.y), dtype=bool)
+        val_mask = np.zeros(len(subj.y), dtype=bool)
+
+        for c in sorted(np.unique(subj.y)):
+            class_trials = np.unique(subj.trial_id[subj.y == c])
+            rng.shuffle(class_trials)
+            n_val = max(1, int(round(len(class_trials) * val_fraction)))
+            val_trials = set(class_trials[:n_val].tolist())
+            class_val_mask = np.array([tid in val_trials for tid in subj.trial_id])
+            val_mask |= class_val_mask & (subj.y == c)
+
+        train_mask = ~val_mask
+
+        train_parts.append(LoadedSubject(
+            X=subj.X[train_mask],
+            y=subj.y[train_mask],
+            subject_id=subj.subject_id[train_mask],
+            trial_id=subj.trial_id[train_mask],
+        ))
+        val_parts.append(LoadedSubject(
+            X=subj.X[val_mask],
+            y=subj.y[val_mask],
+            subject_id=subj.subject_id[val_mask],
+            trial_id=subj.trial_id[val_mask],
+        ))
+
+    return _concat(train_parts), _concat(val_parts)
+
 
 def build_loaders(
-    data_root     : str,
-    val_subject   : int   = 1,
-    subject_id    : int   = 1,
-    strategy      : str   = 'cross_subject',
-    dataset       : str   = 'SEED-IV',
-    n_per_class   : int   = 8,
-    num_workers   : int   = 4,
-    augment_train : bool  = True,
-    val_sessions  : list  = None,
-    feature       : str   = 'de_LDS',
-    leave_one_out : bool  = True,    # ← new flag
-    val_fraction  : float = 0.15,    # ← fraction per subject held out when LOO=False
-    n_subjects    : int   = 15,
-    **kwargs,
-) -> tuple:
+    data_root: str,
+    val_subject: int = 1,
+    dataset: str = "SEED-IV",
+    n_per_class: int = 8,
+    num_workers: int = 4,
+    augment_train: bool = True,
+    feature: str = "de_LDS",
+    leave_one_out: bool = True,
+    val_fraction: float = 0.15,
+    n_subjects: int = 15,
+    seed: int = 42,
+    pin_memory: Optional[bool] = None,
+) -> tuple[DataLoader, DataLoader]:
     """
-    Load SEED-IV DE features and return (train_loader, val_loader).
+    Build train and validation loaders.
 
-    leave_one_out=True  : original behaviour — one subject is held out entirely
-                          as the validation set (cross-subject generalisation).
-
-    leave_one_out=False : val set is built by drawing `val_fraction` of windows
-                          from EVERY subject, so all subjects appear in both
-                          train and val (within-distribution evaluation).
-
-    NOTE: samples have shape (62, 5).
-    Build the model with:   build_model(nb_classes=4, Chans=62, Samples=5)
+    leave_one_out=True is the recommended cross-subject evaluation protocol.
     """
-    nb_classes = 4 if dataset == 'SEED-IV' else 3
-    load_kw    = dict(feature=feature)
+    nb_classes = 4 if dataset == "SEED-IV" else 3
+    pin_memory = torch.cuda.is_available() if pin_memory is None else pin_memory
 
-    print(f"\nBuilding loaders  [LOO={leave_one_out}]  strategy={strategy}  "
-          f"dataset={dataset}  feature={feature}")
+    print(
+        f"\nBuilding loaders | dataset={dataset} | feature={feature} | "
+        f"leave_one_out={leave_one_out}"
+    )
 
-    # ── data loading ──────────────────────────────────────────────────────
     if leave_one_out:
-        # original behaviour
-        if strategy == 'cross_subject':
-            X_tr, y_tr, s_tr, X_va, y_va, s_va = cross_subject_split(
-                data_root, val_subject=val_subject, dataset=dataset,
-                n_subjects=n_subjects, **load_kw
-            )
-        elif strategy == 'within_subject':
-            X_tr, y_tr, s_tr, X_va, y_va, s_va = within_subject_split(
-                data_root, subject_id=subject_id, dataset=dataset,
-                val_sessions=val_sessions, **load_kw
-            )
-        else:
-            raise ValueError(f"Unknown strategy '{strategy}'.")
-
+        train, val = cross_subject_split(
+            data_root=data_root,
+            val_subject=val_subject,
+            dataset=dataset,
+            n_subjects=n_subjects,
+            feature=feature,
+        )
     else:
-        # draw val_fraction of windows from every subject
-        X_tr, y_tr, s_tr = [], [], []
-        X_va, y_va, s_va = [], [], []
+        train, val = trial_level_mixed_subject_split(
+            data_root=data_root,
+            dataset=dataset,
+            n_subjects=n_subjects,
+            feature=feature,
+            val_fraction=val_fraction,
+            seed=seed,
+        )
 
-        for sid in range(1, n_subjects + 1):
-            print(f"  Loading subject {sid:02d}/{n_subjects} …", end=' ', flush=True)
-            X, y = load_subject_data(data_root, sid, dataset=dataset, **load_kw)
-            s    = np.full(len(y), sid - 1, dtype=np.int64)
-            print(f"{len(y)} windows")
+    normalizer = ChannelBandNormalizer()
+    X_train = normalizer.fit_transform(train.X)
+    X_val = normalizer.transform(val.X)
 
-            # stratified split — preserve class balance within each subject
-            from sklearn.model_selection import train_test_split as _tts
-            idx_tr, idx_va = _tts(
-                np.arange(len(y)),
-                test_size    = val_fraction,
-                stratify     = y,
-                random_state = 42,
-            )
+    print(f"\nTrain: {X_train.shape}, labels={np.bincount(train.y, minlength=nb_classes)}")
+    print(f"Val:   {X_val.shape}, labels={np.bincount(val.y, minlength=nb_classes)}")
 
-            X_tr.append(X[idx_tr]); y_tr.append(y[idx_tr]); s_tr.append(s[idx_tr])
-            X_va.append(X[idx_va]); y_va.append(y[idx_va]); s_va.append(s[idx_va])
-
-        X_tr = np.concatenate(X_tr); y_tr = np.concatenate(y_tr); s_tr = np.concatenate(s_tr)
-        X_va = np.concatenate(X_va); y_va = np.concatenate(y_va); s_va = np.concatenate(s_va)
-
-    # ── normalise (fit on train only) ─────────────────────────────────────
-    norm = ChannelNormalizer()
-    X_tr = norm.fit_transform(X_tr)
-    X_va = norm.transform(X_va)
-
-    print(f"\n  Train : {X_tr.shape}  labels {np.bincount(y_tr)}")
-    print(f"  Val   : {X_va.shape}  labels {np.bincount(y_va)}")
-
-    # ── augmentations ─────────────────────────────────────────────────────
     train_transform = (
         ComposeTransforms([GaussianNoise(std=0.05), FreqBandDropout(p=0.2)])
         if augment_train else None
     )
 
-    # ── datasets ──────────────────────────────────────────────────────────
-    train_ds = EEGDataset(X_tr, y_tr, subject_id=s_tr, transform=train_transform)
-    val_ds   = EEGDataset(X_va, y_va, subject_id=s_va)
+    train_ds = EEGDataset(X_train, train.y, train.subject_id, transform=train_transform)
+    val_ds = EEGDataset(X_val, val.y, val.subject_id)
 
-    # ── samplers & loaders ────────────────────────────────────────────────
     train_sampler = BalancedBatchSampler(
-        y_tr, n_per_class=n_per_class, nb_classes=nb_classes
+        train.y,
+        n_per_class=n_per_class,
+        nb_classes=nb_classes,
+        seed=seed,
     )
     batch_size = n_per_class * nb_classes
 
     train_loader = DataLoader(
         train_ds,
-        batch_sampler = train_sampler,
-        num_workers   = num_workers,
-        pin_memory    = True,
+        batch_sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size  = batch_size,
-        shuffle     = False,
-        num_workers = num_workers,
-        pin_memory  = True,
-        drop_last   = False,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
     )
 
-    print(f"\n  Batch size    : {batch_size}  ({n_per_class}/class × {nb_classes} classes)")
-    print(f"  Train batches : {len(train_loader)}")
-    print(f"  Val   batches : {len(val_loader)}\n")
+    print(f"Batch size: {batch_size} ({n_per_class}/class x {nb_classes} classes)")
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches:   {len(val_loader)}\n")
 
     return train_loader, val_loader
