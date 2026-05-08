@@ -139,7 +139,7 @@ class EEGNetEncoder(nn.Module):
         self.b1_drop     = nn.Dropout(dropoutRate)
 
         # ── Block 2 ───────────────────────────────────────────────────────
-        self.b2_sep      = _SeparableConv2d(F1 * D, F2, (1, 16), padding=(0, 8))
+        self.b2_sep      = _SeparableConv2d(F1 * D, F2, (1, 3), padding=(0, 1))
         self.b2_bn       = nn.BatchNorm2d(F2)
         self.b2_pool     = nn.AvgPool2d((1, _pool2))
         self.b2_drop     = nn.Dropout(dropoutRate)
