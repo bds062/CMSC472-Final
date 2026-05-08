@@ -69,7 +69,7 @@ class ContrastiveLoss(nn.Module):
 ## class labels, should be integers from 0 to num_classes - 1
 
 class ContrastivePrototype(nn.Module):
-    def _init_(self, num_classes, temperature = 0.1):
+    def __init__(self, num_classes, temperature = 0.1):
         super().__init__()
         self.num_classes = num_classes
         self.tau = temperature
