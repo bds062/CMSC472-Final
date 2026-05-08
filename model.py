@@ -20,8 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from losses import SEPCLoss
-
 
 class _DepthwiseConv2d(nn.Module):
     """Depthwise Conv2d with optional per-filter max-norm constraint."""
@@ -256,8 +254,10 @@ class Trainer:
     """
     Joint classification + optional contrastive training loop.
 
-    If con_loss_fn is SEPCLoss, batches must include subject_ids and the trainer
-    passes subject_ids to the loss.
+    All contrastive/prototype losses accept the uniform signature
+    ``(features, labels, subject_ids)``.  Subject IDs are always forwarded
+    from the dataloader so that both PrototypeLoss (global EMA) and SEPCLoss
+    (subject-excluded EMA) can maintain per-subject-class prototypes.
     """
     def __init__(
         self,
@@ -302,12 +302,8 @@ class Trainer:
         if self.con_loss_fn is None:
             return torch.tensor(0.0, device=self.device)
 
-        if isinstance(self.con_loss_fn, SEPCLoss):
-            if subject_ids is None:
-                raise ValueError("SEPCLoss requires subject_ids in the batch.")
-            return self.con_loss_fn(proj, labels, subject_ids)
-
-        return self.con_loss_fn(proj, labels)
+        # All contrastive/prototype losses accept (features, labels, subject_ids).
+        return self.con_loss_fn(proj, labels, subject_ids)
 
     def _run_epoch(self, loader, train: bool, epoch: int) -> dict[str, float]:
         self.model.train(train)
