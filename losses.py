@@ -3,15 +3,19 @@ losses.py
 
 Loss functions for EEG emotion recognition on pre-extracted DE features.
 
-This file intentionally contains four losses:
+This file contains four losses:
   1. ClassificationLoss: cross-entropy over class logits.
   2. ContrastiveLoss: supervised contrastive loss over projection embeddings.
-  3. PrototypeLoss: class-prototype loss using batch class prototypes.
-  4. SEPCLoss: subject-excluded prototype contrastive loss.
+  3. PrototypeLoss: EMA class-prototype loss using per-subject-class prototypes
+     averaged over all training subjects (global prototype).
+  4. SEPCLoss: subject-excluded prototype contrastive loss using per-subject-class
+     EMA prototypes averaged over all subjects except the anchor's subject.
 
-SEPCLoss requires subject IDs. It is not equivalent to ordinary leave-one-out
-sample contrastive learning; it excludes all samples from the anchor subject
-when constructing prototypes.
+Both PrototypeLoss and SEPCLoss maintain per-subject-class prototypes via
+exponential moving average. The only difference is whether the anchor subject
+is included (PrototypeLoss) or excluded (SEPCLoss) when forming the class
+prototype target. This makes the PrototypeLoss → SEPCLoss comparison a clean
+ablation of subject exclusion.
 """
 
 from __future__ import annotations
@@ -48,6 +52,8 @@ class ContrastiveLoss(nn.Module):
     Args:
         features: Tensor of shape (B, D), usually projection-head outputs.
         labels: Tensor of shape (B,).
+        subject_ids: Tensor of shape (B,). Accepted for API uniformity but
+            not used by this loss.
     """
     def __init__(self, temperature: float = 0.1, eps: float = 1e-8) -> None:
         super().__init__()
@@ -56,7 +62,12 @@ class ContrastiveLoss(nn.Module):
         self.temperature = temperature
         self.eps = eps
 
-    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        subject_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if features.ndim != 2:
             raise ValueError(f"features must have shape (B, D), got {tuple(features.shape)}")
 
@@ -80,7 +91,6 @@ class ContrastiveLoss(nn.Module):
         valid = positive_counts > 0
 
         if valid.sum() == 0:
-            # Differentiable zero, useful for rare degenerate batches.
             return features.sum() * 0.0
 
         loss_per_anchor = -(
@@ -90,86 +100,179 @@ class ContrastiveLoss(nn.Module):
         return loss_per_anchor.mean()
 
 
-class PrototypeLoss(nn.Module):
-    """
-    Batch class-prototype loss.
+# ---------------------------------------------------------------------------
+# Shared EMA prototype infrastructure
+# ---------------------------------------------------------------------------
 
-    A prototype is computed for each class from the mean of normalized embeddings
-    in that class. Each sample is then classified by similarity to all available
-    class prototypes.
 
-    Args:
-        features: Tensor of shape (B, D).
-        labels: Tensor of shape (B,).
+class _EMAPrototypeBase(nn.Module):
     """
-    def __init__(self, num_classes: int, temperature: float = 0.1) -> None:
+    Base class for losses that maintain per-subject-class EMA prototypes.
+
+    Stores a prototype tensor of shape (num_subjects, num_classes, D) and a
+    boolean mask tracking which (subject, class) pairs have been initialized.
+    Prototypes are lazily allocated on first forward so that embed_dim need
+    not be specified at construction time.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        num_subjects: int,
+        temperature: float = 0.1,
+        ema_alpha: float = 0.9,
+    ) -> None:
         super().__init__()
         if num_classes <= 1:
             raise ValueError("num_classes must be at least 2.")
+        if num_subjects <= 1:
+            raise ValueError("num_subjects must be at least 2.")
         if temperature <= 0:
             raise ValueError("temperature must be positive.")
+        if not 0.0 < ema_alpha < 1.0:
+            raise ValueError("ema_alpha must be in (0, 1).")
+
         self.num_classes = num_classes
+        self.num_subjects = num_subjects
         self.temperature = temperature
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.ema_alpha = ema_alpha
+        self.ce = nn.CrossEntropyLoss()
 
-    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        if features.ndim != 2:
-            raise ValueError(f"features must have shape (B, D), got {tuple(features.shape)}")
+        # Lazily initialized on first forward call.
+        self.prototypes: torch.Tensor | None = None
+        self.initialized: torch.Tensor | None = None
 
-        device = features.device
-        z = F.normalize(features, dim=1)
+    # -- buffer management --------------------------------------------------
 
-        prototypes = []
-        for c in range(self.num_classes):
-            mask = labels == c
-            if mask.any():
-                p = z[mask].mean(dim=0)
-                p = F.normalize(p, dim=0)
-            else:
-                # Missing classes are given a very low logit below.
-                p = torch.zeros(z.size(1), device=device, dtype=z.dtype)
-            prototypes.append(p)
+    def _ensure_buffers(self, dim: int, device: torch.device) -> None:
+        """Create or migrate prototype storage to the correct device."""
+        if self.prototypes is None:
+            self.prototypes = torch.zeros(
+                self.num_subjects, self.num_classes, dim, device=device,
+            )
+            self.initialized = torch.zeros(
+                self.num_subjects, self.num_classes, dtype=torch.bool, device=device,
+            )
+        elif self.prototypes.device != device:
+            self.prototypes = self.prototypes.to(device)
+            self.initialized = self.initialized.to(device)
 
-        prototypes = torch.stack(prototypes, dim=0)
-        logits = torch.matmul(z, prototypes.T) / self.temperature
+    def reset_prototypes(self) -> None:
+        """Clear all stored prototypes. Useful between training runs."""
+        self.prototypes = None
+        self.initialized = None
 
-        # Prevent absent-class zero prototypes from becoming accidental attractors.
-        present = torch.stack([(labels == c).any() for c in range(self.num_classes)]).to(device)
-        logits[:, ~present] = -1e9
+    # -- EMA update ---------------------------------------------------------
 
-        return self.loss_fn(logits, labels)
+    @torch.no_grad()
+    def _update_prototypes(
+        self,
+        z: torch.Tensor,
+        labels: torch.Tensor,
+        subject_ids: torch.Tensor,
+    ) -> None:
+        """
+        Update per-subject-class EMA prototypes from the current batch.
+
+        z should already be L2-normalized.
+        """
+        for s in subject_ids.unique():
+            s_idx = s.item()
+            if s_idx >= self.num_subjects:
+                raise ValueError(
+                    f"subject_id {s_idx} >= num_subjects {self.num_subjects}."
+                )
+            for c in range(self.num_classes):
+                mask = (subject_ids == s) & (labels == c)
+                if not mask.any():
+                    continue
+                batch_mean = z[mask].mean(dim=0)
+                if self.initialized[s_idx, c]:
+                    self.prototypes[s_idx, c] = (
+                        self.ema_alpha * self.prototypes[s_idx, c]
+                        + (1.0 - self.ema_alpha) * batch_mean
+                    )
+                else:
+                    self.prototypes[s_idx, c] = batch_mean
+                    self.initialized[s_idx, c] = True
+                self.prototypes[s_idx, c] = F.normalize(
+                    self.prototypes[s_idx, c], dim=0,
+                )
 
 
-class SEPCLoss(nn.Module):
+class PrototypeLoss(_EMAPrototypeBase):
     """
-    Subject-Excluded Prototype Contrastive loss.
+    Global EMA prototype loss.
 
-    For anchor i with subject s_i, class c prototype p_c^(-s_i) is formed using
-    only samples whose subject_id != s_i and label == c. The anchor is classified
-    by similarity to these subject-excluded class prototypes.
-
-    This is the loss that matches the SEPC idea. It requires subject_ids.
+    Maintains per-subject-class prototypes via EMA. The class prototype for
+    any anchor is the mean of *all* subject prototypes for that class (no
+    exclusion). This serves as the ablation baseline for SEPCLoss.
 
     Args:
         features: Tensor of shape (B, D).
         labels: Tensor of shape (B,).
         subject_ids: Tensor of shape (B,).
     """
-    def __init__(self, num_classes: int, temperature: float = 0.1) -> None:
-        super().__init__()
-        if num_classes <= 1:
-            raise ValueError("num_classes must be at least 2.")
-        if temperature <= 0:
-            raise ValueError("temperature must be positive.")
-        self.num_classes = num_classes
-        self.temperature = temperature
-        self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(
         self,
         features: torch.Tensor,
         labels: torch.Tensor,
-        subject_ids: torch.Tensor,
+        subject_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if subject_ids is None:
+            raise ValueError("PrototypeLoss requires subject_ids for EMA prototypes.")
+        if features.ndim != 2:
+            raise ValueError(f"features must have shape (B, D), got {tuple(features.shape)}")
+
+        device = features.device
+        z = F.normalize(features, dim=1)
+
+        self._ensure_buffers(z.size(1), device)
+        self._update_prototypes(z.detach(), labels, subject_ids)
+
+        # Global class prototypes: average over all initialized subjects.
+        protos = []
+        for c in range(self.num_classes):
+            mask_c = self.initialized[:, c]
+            if mask_c.any():
+                p = self.prototypes[mask_c, c].mean(dim=0)
+                p = F.normalize(p, dim=0)
+            else:
+                p = torch.zeros(z.size(1), device=device, dtype=z.dtype)
+            protos.append(p)
+        protos = torch.stack(protos, dim=0)  # (C, D)
+
+        logits = (z @ protos.T) / self.temperature  # (B, C)
+
+        # Mask out classes with no prototype.
+        present = torch.stack(
+            [self.initialized[:, c].any() for c in range(self.num_classes)],
+        ).to(device)
+        logits[:, ~present] = -1e9
+
+        return self.ce(logits, labels)
+
+
+class SEPCLoss(_EMAPrototypeBase):
+    """
+    Subject-Excluded Prototype Contrastive loss.
+
+    For anchor i with subject s_i, the class c prototype is the mean of
+    per-subject-class EMA prototypes from subjects s != s_i. This removes
+    the current subject's direct contribution to the contrastive target.
+
+    Args:
+        features: Tensor of shape (B, D).
+        labels: Tensor of shape (B,).
+        subject_ids: Tensor of shape (B,).
+    """
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        subject_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if subject_ids is None:
             raise ValueError("SEPCLoss requires subject_ids.")
@@ -178,35 +281,38 @@ class SEPCLoss(nn.Module):
 
         device = features.device
         z = F.normalize(features, dim=1)
-        labels = labels.to(device)
-        subject_ids = subject_ids.to(device)
-
         batch_size = z.size(0)
+
+        self._ensure_buffers(z.size(1), device)
+        self._update_prototypes(z.detach(), labels, subject_ids)
+
         logits = torch.full(
-            (batch_size, self.num_classes),
-            fill_value=-1e9,
-            dtype=z.dtype,
-            device=device,
+            (batch_size, self.num_classes), fill_value=-1e9,
+            dtype=z.dtype, device=device,
         )
 
-        valid_anchor = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-        for i in range(batch_size):
-            anchor_subject = subject_ids[i]
+        # For each unique subject in the batch, compute excluded prototypes
+        # and assign logits to all anchors from that subject.  This iterates
+        # over subjects (≤14 in SEED-IV training) rather than individual
+        # samples, which is much faster than the naive per-sample loop.
+        for s in subject_ids.unique():
+            s_idx = s.item()
+            anchor_mask = subject_ids == s
 
             for c in range(self.num_classes):
-                mask = (labels == c) & (subject_ids != anchor_subject)
-                if not mask.any():
+                excl_mask = self.initialized[:, c].clone()
+                excl_mask[s_idx] = False
+                if not excl_mask.any():
                     continue
 
-                prototype = z[mask].mean(dim=0)
-                prototype = F.normalize(prototype, dim=0)
-                logits[i, c] = torch.dot(z[i], prototype) / self.temperature
+                proto = self.prototypes[excl_mask, c].mean(dim=0)
+                proto = F.normalize(proto, dim=0)
+                logits[anchor_mask, c] = (z[anchor_mask] @ proto) / self.temperature
 
-            # Keep only anchors whose own class has an excluded-subject prototype.
-            valid_anchor[i] = logits[i, labels[i]] > -1e8
+        # Keep only anchors whose own class has a valid excluded prototype.
+        valid = logits[torch.arange(batch_size, device=device), labels] > -1e8
 
-        if valid_anchor.sum() == 0:
+        if valid.sum() == 0:
             return features.sum() * 0.0
 
-        return self.loss_fn(logits[valid_anchor], labels[valid_anchor])
+        return self.ce(logits[valid], labels[valid])
