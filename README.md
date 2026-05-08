@@ -24,15 +24,15 @@ project/
 |   |-- model.py
 |   |-- debug_mat.py
 |-- experiments/
-|   |-- run_experiment.py
 |   |-- sweep.py
 |   |-- plot_sweep.py
-|   |-- inspect_data.py
+|   |-- model_training.jpynb
+
 |-- results/
 |   |-- checkpoints/
 |   |-- sweep_plots/
 |-- notebook/
-|   |-- data_processing.jnpy
+|   |-- data_processing.jpynb
 
 
 ## Project Structure
