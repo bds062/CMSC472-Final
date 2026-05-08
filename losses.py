@@ -102,4 +102,28 @@ class LeaveOneOutContrastiveLearning(nn.Module):
     
     def forward(self, features, labels):
         N = features.shape[0]
-        
+        device = features.device
+        self_mask = torch.eye(N, dtype=torch.bool, device=device)
+        Z = F.normalize(features, dim=1)
+
+        labels = labels.view(-1, 1)
+        pos_mask = torch.eq(labels, labels.T).float()
+        pos_mask.masked_fill_(self_mask, 0)
+        zi_DOT_za = torch.mm(Z, Z.T) / self.tau
+        zi_DOT_za_stable = zi_DOT_za - zi_DOT_za.max(dim=1, keepdim=True).values.detach()
+
+        exp_zi_DOT_za = torch.exp(zi_DOT_za_stable)
+        exp_zi_DOT_za_3d = exp_zi_DOT_za.unsqueeze(1).expand(N, N, N)
+
+        anchor_mask = self_mask.unsqueeze(1).expand(N, N, N)
+        pos_p_mask = self_mask.unsqueeze(0).expand(N, N, N)
+        denom_mask = anchor_mask | pos_p_mask
+
+        denominator = exp_zi_DOT_za_3d.masked_fill(denom_mask, 0).sum(dim=2)
+        numerator = exp_zi_DOT_za
+
+        log_prob = torch.log(numerator + 1e-8) - torch.log(denominator + 1e-8)
+
+        loss = -(pos_mask * log_prob).sum() / pos_mask.sum()
+
+        return loss
