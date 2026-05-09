@@ -17,3 +17,6 @@ torch>=2.4,<3
 # Plotting and sweep analysis
 matplotlib>=3.8,<4
 pandas>=2.1,<3
+
+# yaml
+pyyaml
