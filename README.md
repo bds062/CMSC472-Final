@@ -124,28 +124,23 @@ Here, `Samples=5` means frequency bands, not raw temporal samples.
 
 ### 2. Run a single training experiment
 
-Cross-entropy baseline:
+Use values from config.yaml:
 
 ```bash
-python experiments/run_experiment.py --loss_type ce --epochs 100
+python experiments/model_training.py
 ```
 
-Supervised contrastive learning:
+Use values from a custom config file:
 
 ```bash
-python experiments/run_experiment.py --loss_type contrastive --epochs 100 --temperature 0.1 --lambda_contrastive 0.5
+python experiments/model_training.py --config config.yaml
 ```
 
-Global prototype contrast:
+Override any field via CLI (all optional; take precedence over config.yaml):
 
 ```bash
-python experiments/run_experiment.py --loss_type prototype --epochs 100 --temperature 0.1 --lambda_contrastive 0.5
-```
-
-Leave-one-out / SEPC-style contrastive run:
-
-```bash
-python experiments/run_experiment.py --loss_type leave_one_out --epochs 100 --temperature 0.1 --lambda_contrastive 0.5
+python experiments/model_training.py --run_name Exp01 --loss contrastive --epochs 100 --device cuda
+python experiments/model_training.py --leave_one_out --val_subject 3 --loss prototype
 ```
 
 Outputs are saved under:
@@ -197,7 +192,7 @@ Training time varies by loss function and sweep size. On our setup, a single 100
 Approximate runtime:
 
 ```text
-Single 100-epoch run: ~10 minutes
+Single 100-epoch run: ~10 minutes on a single A4000 GPU
 Small hyperparameter sweep: varies by number of configurations
 Full sweep: number of runs x ~10 minutes per run
 ```
@@ -205,11 +200,6 @@ Full sweep: number of runs x ~10 minutes per run
 Recommended hardware:
 
 ```text
-GPU recommended
+GPU Required
 Tested with a single GPU environment
-CPU training is possible but slower
 ```
-
-## Notes
-
-anything else to add like how u processed the data etc

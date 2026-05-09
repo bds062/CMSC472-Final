@@ -1,0 +1,39 @@
+data:
+  data_root     : ./data                        # path to dataset root
+  dataset       : SEED-IV                       # SEED-IV or SEED
+  feature       : de_LDS
+  n_subjects    : 15
+  n_per_class   : 8
+  num_workers   : 4
+  augment_train : true
+
+  # validation strategy
+  leave_one_out : false                         # true = hold out one subject entirely
+  val_subject   : 1                             # used only when leave_one_out=true
+  val_fraction  : 0.2                           # used only when leave_one_out=false
+  strategy      : cross_subject                 # cross_subject or within_subject
+
+model:
+  nb_classes  : 4
+  Chans       : 62
+  Samples     : 5
+  F1          : 8
+  D           : 2
+  dropoutRate : 0.5
+  proj_hidden : 128
+  proj_out    : 64
+
+train:
+  epochs        : 50
+  lr            : 0.0005
+  weight_decay  : 0.0001
+  lambda_con    : 0.5
+  warmup_epochs : 10
+  loss          : none              # none | contrastive | prototype | locl
+  temperature   : 0.1
+  seed          : 42
+  device        : cuda
+
+logging:
+  run_name : TestRun1
+  log_dir  : ./results/checkpoints
