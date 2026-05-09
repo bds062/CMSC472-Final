@@ -1,0 +1,33 @@
+# Base experiment configuration for SEED-IV EEG emotion recognition
+
+dataset: SEED-IV
+data_root: data
+
+# Data split
+leave_one_out: true
+val_subject: 1
+n_subjects: 15
+
+# Input/model settings
+nb_classes: 4
+chans: 62
+samples: 5
+embedding_dim: 64
+
+# Training
+epochs: 100
+batch_size_per_class: 8
+learning_rate: 0.001
+weight_decay: 0.0001
+num_workers: 4
+augment_train: true
+
+# Loss settings
+loss_type: ce
+temperature: 0.1
+lambda_contrastive: 0.5
+warmup_epochs: 5
+
+# Output
+output_dir: results/checkpoints
+run_name: base_run
