@@ -18,6 +18,11 @@ The main experimental setting is cross-subject emotion recognition, where one su
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
+├── configs/
+│   ├── ce.yaml                    # Cross-entropy experiment config
+│   ├── supcon.yaml                # Supervised contrastive experiment config
+│   ├── prototype.yaml             # Prototype contrastive experiment config
+│   └── sepc.yaml                  # SEPC experiment config
 ├── data/
 │   └── eeg_feature_smooth/        # SEED-IV pre-extracted DE feature files
 ├── src/
@@ -115,21 +120,49 @@ pip install -r requirements.txt
 
 For GPU training, install the PyTorch build that matches your CUDA version using the official PyTorch installation selector. The `requirements.txt` file does not pin a CUDA-specific wheel.
 
+## YAML Configuration Files
+
+Experiment settings are stored in YAML files under `configs/`. This makes each main result easier to reproduce without editing Python source code.
+
+Example config fields include:
+
+```yaml
+dataset: "SEED-IV"
+data_root: "data"
+val_subject: 1
+loss_mode: "sepc"
+epochs: 100
+lr: 0.001
+weight_decay: 0.0001
+lambda_con: 0.5
+temperature: 0.1
+warmup_epochs: 5
+```
+
+The valid loss modes are:
+
+```text
+ce
+supcon
+prototype
+sepc
+```
+
 ---
 
 ## Inspecting the Dataset
 
-Before training, you can verify the `.mat` file structure with:
+Before training, verify the `.mat` file structure with:
 
 ```bash
-python inspect_data.py
+python experiments/inspect_data.py
 ```
 
 Or specify a file manually:
 
 ```bash
-python inspect_data.py \
-  --mat-path /path/to/data/eeg_feature_smooth/1/1_20160518.mat
+python experiments/inspect_data.py \
+  --mat-path data/eeg_feature_smooth/1/1_20160518.mat
 ```
 
 This script prints the available feature keys, their shapes, and confirms that the correct sample extraction is:
@@ -150,33 +183,38 @@ The latter is one frequency band across all windows, not one training sample.
 
 ## Single Experiment
 
-Run a single experiment with:
+Single experiments are run from YAML configuration files in the `configs/` directory.
+
+Cross-entropy baseline:
 
 ```bash
-python run_experiment.py
+python experiments/run_experiment.py --config configs/ce.yaml
 ```
 
-Inside `run_experiment.py`, select the loss mode:
+Supervised contrastive learning:
 
-```python
-LOSS_MODE = "ce"
-LOSS_MODE = "supcon"
-LOSS_MODE = "prototype"
-LOSS_MODE = "sepc"
+```bash
+python experiments/run_experiment.py --config configs/supcon.yaml
 ```
 
-The default recommended evaluation setting is held-out-subject validation:
+Prototype contrastive learning:
 
-```python
-leave_one_out = True
+```bash
+python experiments/run_experiment.py --config configs/prototype.yaml
 ```
 
-This avoids random window-level leakage between train and validation sets.
+Subject-Excluded Prototype Contrastive learning:
+
+```bash
+python experiments/run_experiment.py --config configs/sepc.yaml
+```
+
+Each config file specifies the dataset, held-out subject, model dimensions, loss mode, number of epochs, optimizer settings, contrastive temperature, and loss weight.
 
 Outputs are saved under:
 
 ```text
-checkpoints/<run_name>/
+results/checkpoints/<run_name>/
 ```
 
 Typical saved files include:
@@ -189,7 +227,6 @@ plots.png
 confusion_matrix.png
 classification_report.txt
 ```
-
 ---
 
 ## Hyperparameter Sweep
@@ -197,13 +234,13 @@ classification_report.txt
 Run the full sweep with:
 
 ```bash
-python sweep.py
+python experiments/sweep.py
 ```
 
 Resume from a later run index with:
 
 ```bash
-python sweep.py --start-idx 41
+python experiments/sweep.py --start-idx 41
 ```
 
 The sweep compares:
@@ -218,15 +255,34 @@ sepc
 and saves each run under:
 
 ```text
-checkpoints/<run_name>/
+results/checkpoints/<run_name>/
 ```
 
 A summary CSV is written to:
 
 ```text
-checkpoints/sweep_summary.csv
+results/checkpoints/sweep_summary.csv
+```
+---
+## Expected Runtime and Hardware
+
+Training time depends on the loss function, number of epochs, and hardware. On our setup, a single 100-epoch run takes approximately 10 minutes. Cross-entropy is generally the fastest objective, while supervised contrastive, prototype, and SEPC losses can take longer because they compute additional embedding similarities or prototype-based terms.
+
+Approximate runtime:
+
+```text
+Single 100-epoch run: ~10 minutes
+Single 150-epoch run: ~15 minutes
+Full sweep: number of configurations × ~10 minutes per run
 ```
 
+Recommended hardware:
+
+```text
+GPU recommended
+Tested in a single-GPU environment
+CPU training is possible but slower
+```
 ---
 
 ## Plotting Sweep Results
@@ -234,13 +290,13 @@ checkpoints/sweep_summary.csv
 After running the sweep, generate summary plots with:
 
 ```bash
-python plot_sweep.py checkpoints/sweep_summary.csv
+python experiments/plot_sweep.py results/checkpoints/sweep_summary.csv
 ```
 
 To specify an output directory:
 
 ```bash
-python plot_sweep.py checkpoints/sweep_summary.csv --outdir sweep_plots
+python experiments/plot_sweep.py results/checkpoints/sweep_summary.csv --outdir results/sweep_plots
 ```
 
 The plotting script produces figures comparing loss types, learning rates, contrastive weights, warmup epochs, temperatures, and top-performing runs.
@@ -348,6 +404,9 @@ These settings are included in the experiment scripts.
 ## Minimal Example
 
 ```python
+import sys
+sys.path.append("src")
+
 from dataloader import build_loaders
 from model import build_model, Trainer
 from losses import ClassificationLoss, SEPCLoss
