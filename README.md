@@ -1,32 +1,39 @@
 # EEGNet-Style Cross-Subject EEG Emotion Recognition on SEED-IV
 
-This repository contains a PyTorch implementation of an EEGNet-style model for SEED-IV emotion recognition using pre-extracted differential entropy (DE) features from the `eeg_feature_smooth` directory.
+This repository contains a PyTorch implementation of an EEGNet-style spatial-spectral model for SEED-IV EEG emotion recognition using pre-extracted differential entropy (DE) features from the `eeg_feature_smooth` directory.
 
-The code supports four training objectives:
+The project compares four training objectives:
 
-1. Cross-entropy classification
-2. Supervised contrastive learning
-3. Prototype contrastive learning
-4. Subject-Excluded Prototype Contrastive learning (SEPC)
+- Cross-entropy classification
+- Supervised contrastive learning
+- Prototype contrastive learning
+- Subject-Excluded Prototype Contrastive learning (SEPC)
 
-The main experimental setting is cross-subject emotion recognition, where one subject is held out for validation/test and the model is trained on the remaining subjects.
-
----
+The main experimental setting is cross-subject emotion recognition, where one subject is held out for validation/testing and the model is trained on the remaining subjects.
 
 ## Repository Structure
 
 ```text
 .
-├── dataloader.py        # Loads SEED/SEED-IV DE features and builds DataLoaders
-├── model.py             # EEGNet-style spatial-spectral model and Trainer
-├── losses.py            # CE, SupCon, Prototype, and SEPC losses
-├── run_experiment.py    # Single-run training script
-├── sweep.py             # Hyperparameter sweep script
-├── plot_sweep.py        # Sweep visualization script
-├── inspect_data.py      # Dataset shape sanity-check script
-├── requirements.txt     # Minimal Python dependencies
-└── README.md
+├── README.md
+├── requirements.txt
+├── .gitignore
+├── data/
+│   └── eeg_feature_smooth/        # SEED-IV pre-extracted DE feature files
+├── src/
+│   ├── dataloader.py              # Loads SEED/SEED-IV DE features and builds DataLoaders
+│   ├── model.py                   # EEGNet-style spatial-spectral model and Trainer
+│   └── losses.py                  # CE, SupCon, Prototype, and SEPC losses
+├── experiments/
+│   ├── run_experiment.py          # Single-run training script
+│   ├── sweep.py                   # Hyperparameter sweep script
+│   ├── plot_sweep.py              # Sweep visualization script
+│   └── inspect_data.py            # Dataset shape sanity-check script
+└── results/
+    ├── checkpoints/               # Saved models, training curves, and confusion matrices
+    └── sweep_plots/               # Sweep summary figures
 ```
+
 
 ---
 
