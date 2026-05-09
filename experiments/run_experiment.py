@@ -26,6 +26,9 @@ from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
 )
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT / "src"))
 
 from dataloader import build_loaders
 from losses import ClassificationLoss, ContrastiveLoss, PrototypeLoss, SEPCLoss
