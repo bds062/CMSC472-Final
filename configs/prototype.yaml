@@ -1,4 +1,4 @@
-data_root: "/fs/vulcan-projects/fsh_track/jason-bhargav-temp/CMSC472-Final/data"
+data_root: "data"
 dataset: "SEED-IV"
 val_subject: 1
 
