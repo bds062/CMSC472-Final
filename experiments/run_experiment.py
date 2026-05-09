@@ -15,6 +15,8 @@ import json
 import os
 import random
 from pathlib import Path
+import argparse
+import yaml
 
 import numpy as np
 import torch
@@ -67,6 +69,10 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def load_config(path: str) -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
 
 def build_contrastive_loss(mode: str):
@@ -170,6 +176,42 @@ def save_eval_outputs(model, loader, save_dir: Path) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
+    args = parser.parse_args()
+
+    global DATA_ROOT, DATASET, VAL_SUBJECT, NB_CLASSES, N_SUBJECTS
+    global CHANS, SAMPLES, LOSS_MODE, EPOCHS, N_PER_CLASS
+    global LR, WEIGHT_DECAY, LAMBDA_CON, TEMPERATURE, EMA_ALPHA
+    global WARMUP_EPOCHS, SEED, RUN_NAME, SAVE_DIR
+
+    if args.config is not None:
+        cfg = load_config(args.config)
+
+        DATA_ROOT = cfg.get("data_root", DATA_ROOT)
+        DATASET = cfg.get("dataset", DATASET)
+        VAL_SUBJECT = cfg.get("val_subject", VAL_SUBJECT)
+
+        NB_CLASSES = cfg.get("nb_classes", NB_CLASSES)
+        N_SUBJECTS = cfg.get("n_subjects", N_SUBJECTS)
+        CHANS = cfg.get("chans", CHANS)
+        SAMPLES = cfg.get("samples", SAMPLES)
+
+        LOSS_MODE = cfg.get("loss_mode", LOSS_MODE)
+        EPOCHS = cfg.get("epochs", EPOCHS)
+        N_PER_CLASS = cfg.get("n_per_class", N_PER_CLASS)
+
+        LR = cfg.get("lr", LR)
+        WEIGHT_DECAY = cfg.get("weight_decay", WEIGHT_DECAY)
+        LAMBDA_CON = cfg.get("lambda_con", LAMBDA_CON)
+        TEMPERATURE = cfg.get("temperature", TEMPERATURE)
+        EMA_ALPHA = cfg.get("ema_alpha", EMA_ALPHA)
+        WARMUP_EPOCHS = cfg.get("warmup_epochs", WARMUP_EPOCHS)
+        SEED = cfg.get("seed", SEED)
+
+    RUN_NAME = f"{DATASET}_valsubj={VAL_SUBJECT}_loss={LOSS_MODE}"
+    SAVE_DIR = Path("results/checkpoints") / RUN_NAME
+
     set_seed(SEED)
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
